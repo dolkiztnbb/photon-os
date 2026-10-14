@@ -8,8 +8,8 @@ ISO := $(IMAGE_DIR)/photon.iso
 # --- Раскладка образа диска (в 512-байтных секторах) -------------------------
 # Те же числа передаются в boot/bootsect.asm через -D (правило boot/bootsect.bin),
 # stage2 и ядро узнают их в рантайме из заголовка в MBR (boot/bootinfo.h).
-# stage2 занимает LBA 1..IMG_STAGE2_SECTORS
-IMG_STAGE2_SECTORS := 15
+# stage2 занимает LBA 1..IMG_STAGE2_SECTORS (увеличено для поддержки загрузки ядра из ФС)
+IMG_STAGE2_SECTORS := 31
 # ядро (init.bin): LBA IMG_INIT_LBA, не больше IMG_INIT_SECTORS секторов
 IMG_INIT_LBA := 60
 IMG_INIT_SECTORS := 324
@@ -177,8 +177,30 @@ $(MAP_OUTPUT): init.elf
 	@mkdir -p $(dir $@)
 	@python3 $(MAP_BUILDER) init.elf $@ $(NM)
 
+# Директория для хранения ядер внутри ФС
+KERNEL_FS_DIR := $(FS_SOURCE_DIR)/sys/kernel
+
 # Сборка .vd образа файловой системы с предварительным обновлением карты символов
-build_vd: $(MAP_OUTPUT)
+# + копирование kernel.bin в /sys/kernel для поддержки версионирования и установщика
+build_vd: $(MAP_OUTPUT) init.bin
+	@printf "\033[107;30m Preparing /sys/kernel in filesystem... \033[0m\n"
+	@mkdir -p $(KERNEL_FS_DIR)
+	@cp init.bin $(KERNEL_FS_DIR)/kernel.bin
+	@cp init.bin $(KERNEL_FS_DIR)/kernel-$(DATE).bin
+	@cp init.bin $(KERNEL_FS_DIR)/kernel-1.0.0.bin
+	@echo "kernel.bin" > $(KERNEL_FS_DIR)/boot.cfg
+	@echo "kernel.bin" > $(KERNEL_FS_DIR)/default
+	@echo "kernel.bin" > $(KERNEL_FS_DIR)/active
+	@echo "# PhotonOS kernels" > $(KERNEL_FS_DIR)/versions.txt
+	@echo "Available kernels:" >> $(KERNEL_FS_DIR)/versions.txt
+	@echo "  kernel.bin - current build $(DATE)" >> $(KERNEL_FS_DIR)/versions.txt
+	@echo "  kernel-1.0.0.bin - version 1.0.0" >> $(KERNEL_FS_DIR)/versions.txt
+	@echo "  kernel-$(DATE).bin - build $(DATE)" >> $(KERNEL_FS_DIR)/versions.txt
+	@echo "" >> $(KERNEL_FS_DIR)/versions.txt
+	@echo "To install new kernel, copy .bin file to /sys/kernel/" >> $(KERNEL_FS_DIR)/versions.txt
+	@echo "and update boot.cfg/default to point to it." >> $(KERNEL_FS_DIR)/versions.txt
+	@echo "" >> $(KERNEL_FS_DIR)/versions.txt
+	@echo "Bootloader will show menu if multiple kernels found." >> $(KERNEL_FS_DIR)/versions.txt
 	@printf "\033[107;30m Building full filesystem .vd image... \033[0m\n"
 	@python3 ${FS_BUILDER} ${FS_SOURCE_DIR} kernel/datslaf/fs.vd
 
@@ -284,6 +306,7 @@ clean:
 	@rm -rf *.bin *.dis *.o os-image.bin *.elf *.swp
 	@rm -f *.vd $(MAP_OUTPUT)
 	@rm -rf kernel/*.o boot/*.bin drivers/*.o boot/*.o cpu/*.o libc/*.o */*.o
+	@rm -f $(KERNEL_FS_DIR)/kernel*.bin $(KERNEL_FS_DIR)/boot.cfg $(KERNEL_FS_DIR)/default $(KERNEL_FS_DIR)/active $(KERNEL_FS_DIR)/versions.txt
 	@-rm -rf image
 
 clear:

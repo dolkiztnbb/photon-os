@@ -11,6 +11,7 @@
 #include <cpu/isr.h>
 #include <cpu/malloc/kmalloc.h>
 #include <buildinfo.h>
+#include <setup.h>
 #include <kernel/int80.h>
 #include <kernel/files.h>
 // #include <kernel/microfs.h>
@@ -297,8 +298,21 @@ void main(void *arg){
 			else if (EQ(command, "cat") || EQ(command, "type")) {
 				kprintf(font, 0x0007, 2, LOC_KERNEL_CMD_TYPE);
 			}
+			else if(EQ(command,"klist")||EQ(command,"kver")||EQ(command,"kernels")){
+				kprintf(font,0x0007,2,"KLIST: list kernels in /sys/kernel (supports versioning)\n");
+			}
+			else if(EQ(command,"kset")){
+				kprintf(font,0x0007,2,"KSET <file>: set default kernel to boot (writes /sys/kernel/boot.cfg)\n");
+			}
+			else if(EQ(command,"kinstall")){
+				kprintf(font,0x0007,2,"KINSTALL <src> <dest>: install kernel file to /sys/kernel/\n");
+			}
+			else if(EQ(command,"kinfo")){
+				kprintf(font,0x0007,2,"KINFO: show kernel version and /sys/kernel info\n");
+			}
 			else {
 				kprintf(font,0x0007,2,LOC_KERNEL_CMD_HELP);
+				kprintf(font,0x0007,2,"Additional: klist kset kinstall kinfo\n");
 			}
 		}
 		else if (EQ(command, "list") || EQ(command, "ls") || EQ(command, "dir")) {
@@ -437,6 +451,148 @@ void main(void *arg){
 			pci_scan();
 		}
 		else if(EQ(command,"lsblk")){
+			blockdev_print();
+		}
+		else if(EQ(command,"klist")||EQ(command,"kver")||EQ(command,"kernels")||EQ(command,"kversions")){
+			Dnode* kdir = dnode_find_by_path(ramfs_root, ramfs_root, "/sys/kernel");
+			if (!kdir) {
+				kprintf(font,0x000c,2,"/sys/kernel not found\n");
+			} else if (kdir->type != TYPE_DIR) {
+				kprintf(font,0x000c,2,"/sys/kernel is not a directory\n");
+			} else {
+				kprintf(font,0x0007,2,"Kernels in /sys/kernel:\n");
+				if (kdir->children && kdir->children->size > 0) {
+					for (uint32_t i=0;i<kdir->children->size;i++) {
+						Dnode* child = vector_get(kdir->children, i);
+						if (!child) continue;
+						if (child->type == TYPE_FILE) {
+							// skip meta files for cleaner list, but show them with marker
+							int is_meta = (strcmp(child->name,"boot.cfg")==0 || strcmp(child->name,"default")==0 || strcmp(child->name,"active")==0 || strcmp(child->name,"versions.txt")==0 || strcmp(child->name,"README.txt")==0);
+							if (is_meta) {
+								kprintf(font,0x0008,2,"  [meta] %s (%d bytes)\n", child->name, child->size);
+							} else {
+								kprintf(font,0x000a,2,"  [kernel] %s (%d bytes)\n", child->name, child->size);
+							}
+						} else if (child->type == TYPE_DIR) {
+							kprintf(font,0x0009,2,"  [dir] %s/\n", child->name);
+						}
+					}
+				} else {
+					kprintf(font,0x0007,2,"  <none>\n");
+				}
+				// show boot.cfg / default
+				Dnode* bc = DFC(kdir,"boot.cfg");
+				if (bc && bc->type==TYPE_FILE && bc->data) {
+					kprintf(font,0x0007,2,"Default (boot.cfg): %s\n", bc->data);
+				} else {
+					Dnode* def = DFC(kdir,"default");
+					if (def && def->type==TYPE_FILE && def->data) {
+						kprintf(font,0x0007,2,"Default (default): %s\n", def->data);
+					} else {
+						kprintf(font,0x0007,2,"Default: kernel.bin (fallback)\n");
+					}
+				}
+				kprintf(font,0x0007,2,"Current running: kernel %d.%d.%d\n", __PHT_KV_HIGH__, __PHT_KV_MID__, __PHT_KV_LOW__);
+			}
+		}
+		else if(EQ(command,"kset")){
+			if (argc < 2) {
+				kprintf(font,0x000c,2,"Usage: kset <kernel_filename> - set default kernel in /sys/kernel/\n");
+				kprintf(font,0x0007,2,"Example: kset kernel-1.0.0.bin\n");
+			} else {
+				Dnode* kdir = dnode_find_by_path(ramfs_root, ramfs_root, "/sys/kernel");
+				if (!kdir) {
+					kprintf(font,0x000c,2,"/sys/kernel not found\n");
+				} else {
+					Dnode* target = DFC(kdir, argv[1]);
+					if (!target || target->type != TYPE_FILE) {
+						kprintf(font,0x000c,2,"Kernel file not found: %s\n", argv[1]);
+					} else {
+						// update boot.cfg, default, active
+						const char* files_to_update[] = {"boot.cfg","default","active"};
+						for (int f=0; f<3; f++) {
+							Dnode* bf = DFC(kdir, files_to_update[f]);
+							if (!bf) {
+								char pathbuf[64];
+								clear(pathbuf,64);
+								append_string(pathbuf,"/sys/kernel/");
+								append_string(pathbuf,files_to_update[f]);
+								bf = dnode_create_at_path(ramfs_root, ramfs_root, pathbuf, TYPE_FILE);
+							}
+							if (bf) {
+								// clear old data
+								if (bf->data) kfree(bf->data);
+								uint32_t len = strlen(argv[1]);
+								bf->data = kmalloc(len+2);
+								if (bf->data) {
+									for (uint32_t i=0;i<len;i++) bf->data[i]=argv[1][i];
+									bf->data[len]='\n';
+									bf->data[len+1]='\0';
+									bf->size=len+1;
+									fs_flush_node(bf);
+								}
+							}
+						}
+						kprintf(font,0x000a,2,"Default kernel set to %s\n", argv[1]);
+						kprintf(font,0x0007,2,"It will be used on next boot (if bootloader FS support present)\n");
+					}
+				}
+			}
+		}
+		else if(EQ(command,"kinstall")){
+			if (argc < 3) {
+				kprintf(font,0x000c,2,"Usage: kinstall <source_path> <dest_name>\n");
+				kprintf(font,0x0007,2,"Example: kinstall /home/newkernel.bin kernel-1.1.0.bin\n");
+				kprintf(font,0x0007,2,"Copies file to /sys/kernel/<dest_name>\n");
+			} else {
+				Dnode* src = dnode_find_by_path(ramfs_root, current_node, argv[1]);
+				if (!src || src->type != TYPE_FILE) {
+					kprintf(font,0x000c,2,"Source file not found: %s\n", argv[1]);
+				} else {
+					char destpath[128];
+					clear(destpath,128);
+					append_string(destpath,"/sys/kernel/");
+					append_string(destpath,argv[2]);
+					// check if dest exists
+					Dnode* existing = dnode_find_by_path(ramfs_root, ramfs_root, destpath);
+					if (existing) {
+						kprintf(font,0x000e,2,"Destination %s already exists, overwriting...\n", destpath);
+						if (existing->data) kfree(existing->data);
+						existing->data = kmalloc(src->size);
+						if (existing->data) {
+							for (uint32_t i=0;i<src->size;i++) existing->data[i]=src->data[i];
+							existing->size=src->size;
+							fs_flush_node(existing);
+							kprintf(font,0x000a,2,"Installed %s (%d bytes)\n", destpath, src->size);
+						}
+					} else {
+						Dnode* dst = dnode_create_at_path(ramfs_root, ramfs_root, destpath, TYPE_FILE);
+						if (!dst) {
+							kprintf(font,0x000c,2,"Failed to create %s\n", destpath);
+						} else {
+							dst->data = kmalloc(src->size);
+							if (dst->data) {
+								for (uint32_t i=0;i<src->size;i++) dst->data[i]=src->data[i];
+								dst->size=src->size;
+								fs_flush_node(dst);
+								kprintf(font,0x000a,2,"Installed %s (%d bytes)\n", destpath, src->size);
+							} else {
+								kprintf(font,0x000c,2,"Out of memory\n");
+							}
+						}
+					}
+				}
+			}
+		}
+		else if(EQ(command,"kinfo")){
+			kprintf(font,0x0007,2,"PhotonOS kernel %d.%d.%d\n", __PHT_KV_HIGH__, __PHT_KV_MID__, __PHT_KV_LOW__);
+			kprintf(font,0x0007,2,"Build: %s\n", BUILD_DATE);
+			Dnode* kdir = dnode_find_by_path(ramfs_root, ramfs_root, "/sys/kernel");
+			if (kdir) {
+				kprintf(font,0x0007,2,"/sys/kernel exists, %d entries\n", kdir->children ? kdir->children->size : 0);
+			} else {
+				kprintf(font,0x0007,2,"/sys/kernel not found (old image?)\n");
+			}
 			blockdev_print();
 		}
 		else if(EQ(command,"memleak")){

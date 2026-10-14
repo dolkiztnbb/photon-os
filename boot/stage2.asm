@@ -4,14 +4,15 @@
 ;  Запускается из bootsect.asm по адресу STAGE2_ADDR (0x8200) в реальном
 ;  режиме: DS=ES=SS=0, SP=0x7C00, DL = загрузочный диск, bootinfo (0x600)
 ;  частично заполнен (magic, drive, sector_shift, image_lba, flags).
-;  Копия первых 8 КБ образа (MBR + stage2) лежит по IMAGE_HEAD_ADDR.
+;  Копия первых 16 КБ образа (MBR + stage2) лежит по IMAGE_HEAD_ADDR.
 ;
 ;  Что делаем:
 ;    1. определяем тип носителя (HDD/floppy/CD), геометрию для CHS;
 ;    2. включаем A20, определяем объём памяти (int 15h E801);
 ;    3. включаем «unreal mode» (DS/ES с лимитом 4 ГБ) — это позволяет
 ;       класть данные выше 1 МБ, продолжая пользоваться BIOS;
-;    4. грузим init.bin (ядро) по KERNEL_ADDR через буфер BOUNCE_ADDR;
+;    4. ПЫТАЕМСЯ загрузить ядро из ФС /sys/kernel (поддержка версий);
+;       если не получилось — fallback на старый метод (init.bin по LBA);
 ;    5. копируем ВЕСЬ образ в ОЗУ по RAMDISK_ADDR — ядро использует эту
 ;       копию как блочное устройство, если у него нет собственного драйвера
 ;       для загрузочного носителя (USB, SATA CD-ROM и т.п.);
@@ -26,6 +27,22 @@
 BI              equ BOOTINFO_ADDR
 HDR             equ IMAGE_HEAD_ADDR + IMGHDR_OFFSET
 KBC_TIMEOUT     equ 0xFFFF
+
+; --- дополнительные адреса для FS-загрузчика ---------------------------------
+; Располагаем ниже 64КБ, чтобы доступ через SI работал в реальном режиме
+FS_NODES_ADDR       equ 0xC000      ; куда грузим таблицу узлов DATSLAF (до ~7KB)
+FS_LIST_ADDR        equ 0xE000      ; список id ядер в /sys/kernel (до 100*4)
+FS_TMP_NAME_ADDR    equ 0xE400      ; временный буфер для имени из boot.cfg
+FS_BOOTCFG_BUF      equ 0xE600      ; буфер для содержимого boot.cfg (512 байт)
+FS_MAGIC            equ 0xDA751AF5
+NODE_SIZE           equ 64
+NODE_TYPE_OFF       equ 0
+NODE_NAME_OFF       equ 1
+NODE_SIZE_FIELD_OFF equ 33
+NODE_PARENT_OFF     equ 45
+NODE_DATA_BLOCK_OFF equ 49
+TYPE_FILE           equ 0
+TYPE_DIR            equ 1
 
 [org STAGE2_ADDR]
 [bits 16]
@@ -106,8 +123,12 @@ start:
     jc .a20_failed
     or byte [BI + BI_FLAGS], BOOTF_A20
 
-    ; --- ядро: init.bin -> KERNEL_ADDR -----------------------------------------
-    mov si, msg_kernel
+    ; --- попытка загрузить ядро из ФС /sys/kernel -----------------------------
+    call fs_try_load_kernel
+    jnc .after_kernel
+
+    ; --- fallback: ядро по фиксированному LBA (старый метод) ------------------
+    mov si, msg_kernel_lba
     call puts
     mov eax, [HDR + IH_INIT_LBA]
     mov ecx, [HDR + IH_INIT_SECTORS]
@@ -117,6 +138,9 @@ start:
     mov [BI + BI_KERNEL_SECTORS], ecx
     mov si, msg_ok
     call puts
+    jmp .after_kernel
+
+.after_kernel:
 
     ; --- копия образа в ОЗУ (ramdisk) ------------------------------------------
     mov si, msg_ramdisk
@@ -181,6 +205,563 @@ fatal:
 .halt:
     hlt
     jmp .halt
+
+; =============================================================================
+;  FS-загрузчик: попытка загрузить ядро из /sys/kernel
+;  Возвращает CF=0 успех, CF=1 неудача
+; =============================================================================
+fs_try_load_kernel:
+    pushad
+    mov si, msg_fs_try
+    call puts
+
+    ; --- читаем суперблок ФС -------------------------------------------------
+    mov eax, [BI + BI_FS_LBA]
+    mov [fs_lba_512], eax
+    test eax, eax
+    jz .fail
+
+    mov eax, [fs_lba_512]
+    mov ecx, 1
+    mov edi, BOUNCE_ADDR
+    call load_image_region
+    jc .fail
+
+    mov eax, [BOUNCE_ADDR]
+    cmp eax, FS_MAGIC
+    jne .fail
+
+    mov eax, [BOUNCE_ADDR+4] ; total_nodes
+    mov [fs_total_nodes], eax
+    test eax, eax
+    jz .fail
+    cmp eax, 100
+    ja .fail
+
+    ; sectors for nodes = (total_nodes*64+511)/512
+    mov ebx, eax
+    shl ebx, 6
+    add ebx, 511
+    shr ebx, 9
+    mov [fs_nodes_sectors], ebx
+
+    ; --- грузим таблицу узлов в FS_NODES_ADDR --------------------------------
+    mov eax, [fs_lba_512]
+    inc eax ; FS_LBA+1
+    mov ecx, ebx
+    mov edi, FS_NODES_ADDR
+    call load_image_region
+    jc .fail
+
+    ; --- ищем корень -----------------------------------------------------------
+    call fs_find_root
+    jc .fail
+    mov [fs_root_id], eax
+
+    ; --- ищем /sys -------------------------------------------------------------
+    mov eax, [fs_root_id]
+    mov si, name_sys
+    call fs_find_child
+    jc .fail
+    mov [fs_sys_id], eax
+
+    ; --- ищем /sys/kernel ------------------------------------------------------
+    mov eax, [fs_sys_id]
+    mov si, name_kernel
+    call fs_find_child
+    jc .fail
+    mov [fs_kernel_dir_id], eax
+
+    ; --- пробуем прочитать boot.cfg / default для выбора версии ---------------
+    mov eax, [fs_kernel_dir_id]
+    mov si, name_bootcfg
+    call fs_find_child
+    jnc .have_bootcfg
+    mov eax, [fs_kernel_dir_id]
+    mov si, name_default
+    call fs_find_child
+    jnc .have_bootcfg
+    mov eax, [fs_kernel_dir_id]
+    mov si, name_active
+    call fs_find_child
+    jnc .have_bootcfg
+    jmp .no_bootcfg
+
+.have_bootcfg:
+    mov [fs_bootcfg_id], eax
+    ; загружаем boot.cfg в FS_BOOTCFG_BUF
+    mov eax, [fs_bootcfg_id]
+    mov edi, FS_BOOTCFG_BUF
+    call fs_load_file_by_id
+    jc .no_bootcfg
+    ; парсим имя файла из FS_BOOTCFG_BUF в FS_TMP_NAME_ADDR
+    mov si, FS_BOOTCFG_BUF
+    mov di, FS_TMP_NAME_ADDR
+    call fs_parse_filename
+    ; ищем файл с таким именем в /sys/kernel
+    mov eax, [fs_kernel_dir_id]
+    mov si, FS_TMP_NAME_ADDR
+    call fs_find_child
+    jnc .found_kernel
+
+.no_bootcfg:
+    ; --- пробуем kernel.bin ----------------------------------------------------
+    mov eax, [fs_kernel_dir_id]
+    mov si, name_kernel_bin
+    call fs_find_child
+    jnc .found_kernel
+
+    ; --- ищем любой .bin или первый файл в /sys/kernel -------------------------
+    call fs_list_kernels_and_select
+    jc .fail
+    jmp .found_kernel_id_in_eax
+
+.found_kernel:
+    mov [fs_kernel_file_id], eax
+    jmp .load_kernel_file
+
+.found_kernel_id_in_eax:
+    mov [fs_kernel_file_id], eax
+
+.load_kernel_file:
+    ; загружаем выбранный файл ядра
+    mov ebx, FS_NODES_ADDR
+    mov ecx, [fs_kernel_file_id]
+    shl ecx, 6
+    add ebx, ecx ; ebx = node ptr
+    mov eax, [ebx + NODE_SIZE_FIELD_OFF]
+    mov edx, [ebx + NODE_DATA_BLOCK_OFF]
+    mov [fs_kernel_size], eax
+    mov [fs_kernel_data_block], edx
+    test eax, eax
+    jz .fail
+
+    mov si, msg_loading_fs_kernel
+    call puts
+    push si
+    mov si, ebx
+    add si, NODE_NAME_OFF
+    call puts
+    pop si
+    mov si, msg_newline
+    call puts
+
+    mov eax, [fs_lba_512]
+    add eax, edx ; FS_LBA + data_block
+    mov ecx, [fs_kernel_size]
+    add ecx, 511
+    shr ecx, 9
+    mov edi, [HDR + IH_KERNEL_ADDR]
+    call load_image_region
+    jc .fail
+
+    mov eax, [fs_kernel_size]
+    add eax, 511
+    shr eax, 9
+    mov [BI + BI_KERNEL_SECTORS], eax
+
+    mov si, msg_fs_kernel_ok
+    call puts
+    popad
+    clc
+    ret
+
+.fail:
+    mov si, msg_fs_kernel_fail
+    call puts
+    popad
+    stc
+    ret
+
+; -----------------------------------------------------------------------------
+; fs_find_root: найти узел с parent_id == -1
+; выход: EAX = id корня, CF=0 успех
+; -----------------------------------------------------------------------------
+fs_find_root:
+    push ebx
+    push ecx
+    push edx
+    mov ecx, [fs_total_nodes]
+    xor edx, edx
+.loop:
+    cmp edx, ecx
+    jae .notfound
+    mov ebx, FS_NODES_ADDR
+    mov eax, edx
+    shl eax, 6
+    add ebx, eax
+    mov eax, [ebx + NODE_PARENT_OFF]
+    cmp eax, -1
+    je .found
+    inc edx
+    jmp .loop
+.found:
+    mov eax, edx
+    pop edx
+    pop ecx
+    pop ebx
+    clc
+    ret
+.notfound:
+    pop edx
+    pop ecx
+    pop ebx
+    stc
+    ret
+
+; -----------------------------------------------------------------------------
+; fs_find_child: найти дочерний узел по parent_id и имени
+; вход: EAX = parent_id, SI = имя (ASCIIZ)
+; выход: EAX = node id, EBX = node ptr, CF=0 успех
+; -----------------------------------------------------------------------------
+fs_find_child:
+    push ecx
+    push edx
+    push edi
+    push esi
+    mov [fs_find_parent], eax
+    mov [fs_find_name_ptr], si
+    mov ecx, [fs_total_nodes]
+    xor edx, edx
+.loop:
+    cmp edx, ecx
+    jae .notfound
+    mov ebx, FS_NODES_ADDR
+    mov eax, edx
+    shl eax, 6
+    add ebx, eax ; ebx = node ptr
+    mov eax, [ebx + NODE_PARENT_OFF]
+    cmp eax, [fs_find_parent]
+    jne .next
+    ; сравниваем имя
+    mov si, [fs_find_name_ptr]
+    mov di, ebx
+    add di, NODE_NAME_OFF
+    call fs_streq
+    jnc .found
+.next:
+    inc edx
+    jmp .loop
+.found:
+    mov eax, edx
+    ; ebx уже указывает на узел
+    pop esi
+    pop edi
+    pop edx
+    pop ecx
+    clc
+    ret
+.notfound:
+    pop esi
+    pop edi
+    pop edx
+    pop ecx
+    stc
+    ret
+
+fs_find_parent: dd 0
+fs_find_name_ptr: dw 0,0 ; actually 32-bit pointer but we use SI offset in low mem, so store as dd
+
+; -----------------------------------------------------------------------------
+; fs_streq: сравнить строку SI (ASCIIZ) с именем DI (32 байта, null-term)
+; выход: CF=0 равны, CF=1 не равны
+; -----------------------------------------------------------------------------
+fs_streq:
+    push ax
+    push si
+    push di
+    push cx
+    mov cx, 32
+.loop:
+    lodsb
+    mov ah, [di]
+    cmp al, ah
+    jne .noteq
+    test al, al
+    jz .eq
+    inc di
+    loop .loop
+    ; если дошли до 32 символов и SI тоже закончился (или следующий 0) — равны
+    lodsb
+    test al, al
+    jz .eq
+    jmp .noteq
+.eq:
+    pop cx
+    pop di
+    pop si
+    pop ax
+    clc
+    ret
+.noteq:
+    pop cx
+    pop di
+    pop si
+    pop ax
+    stc
+    ret
+
+; -----------------------------------------------------------------------------
+; fs_load_file_by_id: загрузить файл по id в EDI
+; вход: EAX = node id, EDI = phys dest
+; выход: CF
+; -----------------------------------------------------------------------------
+fs_load_file_by_id:
+    push eax
+    push ebx
+    push ecx
+    push edx
+    push edi
+    mov ebx, FS_NODES_ADDR
+    shl eax, 6
+    add ebx, eax
+    mov eax, [ebx + NODE_SIZE_FIELD_OFF]
+    mov edx, [ebx + NODE_DATA_BLOCK_OFF]
+    test eax, eax
+    jz .fail
+    mov ecx, eax
+    add ecx, 511
+    shr ecx, 9
+    mov eax, [fs_lba_512]
+    add eax, edx
+    ; EDI уже dest
+    call load_image_region
+    jmp .out
+.fail:
+    stc
+.out:
+    pop edi
+    pop edx
+    pop ecx
+    pop ebx
+    pop eax
+    ret
+
+; -----------------------------------------------------------------------------
+; fs_parse_filename: извлечь первое слово из файла (до \r \n \0 space)
+; вход: SI = source buffer, DI = dest buffer (FS_TMP_NAME_ADDR)
+; выход: DI указывает на dest (null-term)
+; -----------------------------------------------------------------------------
+fs_parse_filename:
+    push ax
+    push si
+    push di
+    push cx
+    mov cx, 64
+.skip_spaces:
+    lodsb
+    test al, al
+    jz .end
+    cmp al, ' '
+    je .skip_spaces
+    cmp al, 9
+    je .skip_spaces
+    cmp al, 13
+    je .skip_spaces
+    cmp al, 10
+    je .skip_spaces
+    ; первый символ имени
+    jmp .copy_char
+.copy_loop:
+    lodsb
+    test al, al
+    jz .end
+    cmp al, 13
+    je .end
+    cmp al, 10
+    je .end
+    cmp al, ' '
+    je .end
+    cmp al, 9
+    je .end
+.copy_char:
+    stosb
+    loop .copy_loop
+.end:
+    mov al, 0
+    stosb
+    pop cx
+    pop di
+    pop si
+    pop ax
+    ret
+
+; -----------------------------------------------------------------------------
+; fs_list_kernels_and_select: перечислить файлы в /sys/kernel и дать выбор
+; вход: fs_kernel_dir_id установлен
+; выход: EAX = выбранный node id, CF=0 успех
+; -----------------------------------------------------------------------------
+fs_list_kernels_and_select:
+    push ebx
+    push ecx
+    push edx
+    push esi
+    push edi
+
+    mov eax, [fs_kernel_dir_id]
+    mov [fs_find_parent], eax
+    mov ecx, [fs_total_nodes]
+    xor edx, edx
+    xor ebx, ebx ; count
+    mov edi, FS_LIST_ADDR
+
+.collect_loop:
+    cmp edx, ecx
+    jae .collect_done
+    push ebx
+    push edi
+    mov ebx, FS_NODES_ADDR
+    mov eax, edx
+    shl eax, 6
+    add ebx, eax
+    mov eax, [ebx + NODE_PARENT_OFF]
+    cmp eax, [fs_find_parent]
+    jne .collect_next
+    mov al, [ebx + NODE_TYPE_OFF]
+    cmp al, TYPE_FILE
+    jne .collect_next
+    ; опционально фильтруем .bin, но берём все файлы кроме boot.cfg/default/active
+    mov si, ebx
+    add si, NODE_NAME_OFF
+    push si
+    mov si, name_bootcfg
+    mov di, ebx
+    add di, NODE_NAME_OFF
+    call fs_streq
+    pop si
+    jnc .collect_next
+    mov si, name_default
+    mov di, ebx
+    add di, NODE_NAME_OFF
+    push ebx
+    call fs_streq
+    pop ebx
+    jnc .collect_next
+    mov si, name_active
+    mov di, ebx
+    add di, NODE_NAME_OFF
+    push ebx
+    call fs_streq
+    pop ebx
+    jnc .collect_next
+
+    ; это кандидат
+    pop edi
+    pop ebx
+    mov eax, edx
+    stosd
+    inc ebx
+    jmp .collect_cont
+
+.collect_next:
+    pop edi
+    pop ebx
+.collect_cont:
+    inc edx
+    jmp .collect_loop
+
+.collect_done:
+    mov [fs_kernel_count], ebx
+    test ebx, ebx
+    jz .fail
+
+    cmp ebx, 1
+    je .single
+
+    ; --- показать список -----------------------------------------------------
+    mov si, msg_kernel_list_header
+    call puts
+    xor edx, edx
+.print_loop:
+    cmp edx, ebx
+    jae .ask
+    mov si, msg_kernel_list_item
+    call puts
+    mov al, '0'
+    add al, dl
+    call putc
+    mov al, ')'
+    call putc
+    mov al, ' '
+    call putc
+    ; имя файла
+    mov esi, FS_LIST_ADDR
+    mov eax, edx
+    shl eax, 2
+    add esi, eax
+    mov eax, [esi] ; id
+    mov esi, FS_NODES_ADDR
+    shl eax, 6
+    add esi, eax
+    add esi, NODE_NAME_OFF
+    mov si, si ; si already low 16? need full? SI is 16-bit, but ESI may be >64K? FS_NODES_ADDR 0x18000 <64K, so SI ok
+    ; Actually we have 32-bit ESI, but puts expects SI (16-bit) pointing to low mem string.
+    ; Since nodes are in low mem (<0x20000), we can use SI = low 16 bits
+    call puts
+    call newline
+    inc edx
+    jmp .print_loop
+
+.ask:
+    mov si, msg_kernel_select_prompt
+    call puts
+
+.wait_key:
+    mov ah, 0
+    int 0x16 ; AL=ASCII
+    cmp al, 13 ; Enter
+    je .select_default
+    cmp al, '0'
+    jb .wait_key
+    cmp al, '9'
+    ja .wait_key
+    sub al, '0'
+    movzx edx, al
+    cmp edx, [fs_kernel_count]
+    jae .wait_key
+    ; echo
+    call putc
+    call newline
+    jmp .selected
+
+.select_default:
+    mov si, msg_newline
+    call puts
+    xor edx, edx
+
+.selected:
+    mov esi, FS_LIST_ADDR
+    mov eax, edx
+    shl eax, 2
+    add esi, eax
+    mov eax, [esi]
+    pop edi
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    clc
+    ret
+
+.single:
+    mov esi, FS_LIST_ADDR
+    mov eax, [esi]
+    pop edi
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    clc
+    ret
+
+.fail:
+    pop edi
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    stc
+    ret
 
 ; =============================================================================
 ;  load_image_region — загрузить кусок образа в физическую память
@@ -719,14 +1300,16 @@ vga_disable_blink:
     ret
 
 ; =============================================================================
-msg_banner:     db 13, 10, "PhotonOS loader (stage2)", 13, 10, 0
+;  Данные / сообщения
+; =============================================================================
+msg_banner:     db 13, 10, "PhotonOS loader (stage2) v2 - FS kernel support", 13, 10, 0
 msg_drive:      db "boot drive: 0x", 0
 msg_hdd:        db " [HDD/USB, LBA]", 0
 msg_floppy:     db " [floppy, CHS]", 0
 msg_cdrom:      db " [CD-ROM, El Torito]", 0
 msg_iso:        db " [ISO]", 0
 msg_image_lba:  db ", image LBA 0x", 0
-msg_kernel:     db "loading kernel ", 0
+msg_kernel_lba: db "loading kernel (LBA) ", 0
 msg_ramdisk:    db "copying image to RAM ", 0
 msg_ok:         db " OK", 13, 10, 0
 msg_partial:    db " PARTIAL (read errors, filesystem may be incomplete)", 13, 10, 0
@@ -736,3 +1319,34 @@ msg_err:        db 13, 10, "BOOT ERROR: ", 0
 msg_err_header: db "bad image header", 0
 msg_err_a20:    db "cannot enable A20", 0
 msg_err_kernel: db "kernel read failed", 0
+
+; --- FS loader messages -------------------------------------------------------
+msg_fs_try:                 db "checking /sys/kernel in filesystem...", 13, 10, 0
+msg_fs_kernel_fail:         db "FS kernel not found, fallback to LBA", 13, 10, 0
+msg_fs_kernel_ok:           db "FS kernel loaded OK", 13, 10, 0
+msg_loading_fs_kernel:      db "loading FS kernel: ", 0
+msg_newline:                db 13, 10, 0
+msg_kernel_list_header:     db 13, 10, "Available kernels in /sys/kernel:", 13, 10, 0
+msg_kernel_list_item:       db "  ", 0
+msg_kernel_select_prompt:   db 13, 10, "Select kernel [0-9] or Enter for default: ", 0
+
+; --- FS names -----------------------------------------------------------------
+name_sys:           db "sys",0
+name_kernel:        db "kernel",0
+name_kernel_bin:    db "kernel.bin",0
+name_bootcfg:       db "boot.cfg",0
+name_default:       db "default",0
+name_active:        db "active",0
+
+; --- FS loader variables ------------------------------------------------------
+fs_lba_512:         dd 0
+fs_total_nodes:     dd 0
+fs_nodes_sectors:   dd 0
+fs_root_id:         dd 0
+fs_sys_id:          dd 0
+fs_kernel_dir_id:   dd 0
+fs_kernel_file_id:  dd 0
+fs_kernel_size:     dd 0
+fs_kernel_data_block: dd 0
+fs_bootcfg_id:      dd 0
+fs_kernel_count:    dd 0
