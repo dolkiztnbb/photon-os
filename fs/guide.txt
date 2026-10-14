@@ -1,0 +1,7 @@
+You have successfully installed PhotonOS onto your drive!
+Yes, that was it - there is no more steps to do, meaning
+this operating system is a Live Boot drive.
+
+Have fun!
+
+@039 =3

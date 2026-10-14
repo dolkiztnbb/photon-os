@@ -1,0 +1,14 @@
+*.zip
+*.rar
+*.o
+*.out
+*.log
+autozip
+installer
+
+# build artifacts (make os-image.bin / make iso)
+output/
+*.iso
+boot/*.bin
+buildinfo.h
+disasm.txt
