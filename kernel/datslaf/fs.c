@@ -1,8 +1,15 @@
 #include "fs.h"
-#include <drivers/ahci.h>
+#include <drivers/blockdev.h>
 #include <cpu/malloc/kmalloc.h>
+#include <kernel/debug.h>
 
+// Смещение файловой системы внутри образа ОС (в 512-байтных секторах).
+// Makefile передаёт его через -DFS_START_SECTOR=$(IMG_FS_LBA); то же число
+// загрузчик кладёт в bootinfo.fs_lba, и fs_load_from_disk() сверяет их.
+// Где физически лежит образ (диск, CD, ramdisk) — решает drivers/blockdev.c.
+#ifndef FS_START_SECTOR
 #define FS_START_SECTOR      384
+#endif
 #define MAX_DISK_NODES       100
 #define MAX_FILE_SIZE         (1024 * 1024 * 1024)
 
@@ -18,10 +25,10 @@ uint32_t current_data_sector = FS_START_SECTOR + 15;
 __attribute__((aligned(512))) static char fs_dma_buf[512];
 
 static void update_superblock_count(uint32_t count) {
-    if (ahci_read_sector(FS_START_SECTOR, fs_dma_buf) == 0) {
+    if (blk_read_sector(FS_START_SECTOR, fs_dma_buf) == 0) {
         disk_superblock_t *sb = (disk_superblock_t*)fs_dma_buf;
         sb->total_nodes = count;
-        ahci_write_sector(FS_START_SECTOR, fs_dma_buf);
+        blk_write_sector(FS_START_SECTOR, fs_dma_buf);
     }
 }
 
@@ -57,7 +64,7 @@ void fs_flush_node(Dnode* node) {
             for (uint32_t b = 0; b < bytes_to_copy; b++) {
                 fs_dma_buf[b] = node->data[offset + b];
             }
-            ahci_write_sector(abs_data_sector + i, fs_dma_buf);
+            blk_write_sector(abs_data_sector + i, fs_dma_buf);
         }
     }
 
@@ -81,14 +88,14 @@ void fs_flush_node(Dnode* node) {
     uint32_t offset_in_sector = byte_offset % 512;
 
     // Читаем сектор, модифицируем нужные 64 байта и пишем обратно через DMA буфер ядра
-    ahci_read_sector(target_sector, fs_dma_buf);
+    blk_read_sector(target_sector, fs_dma_buf);
 
     char* p = (char*)&d_node;
     for (uint32_t i = 0; i < sizeof(disk_dnode_t); i++) {
         fs_dma_buf[offset_in_sector + i] = p[i];
     }
 
-    ahci_write_sector(target_sector, fs_dma_buf);
+    blk_write_sector(target_sector, fs_dma_buf);
 }
 
 void fs_delete_node(Dnode* node) {
@@ -98,11 +105,11 @@ void fs_delete_node(Dnode* node) {
     uint32_t target_sector = FS_START_SECTOR + 1 + (byte_offset / 512);
     uint32_t offset_in_sector = byte_offset % 512;
 
-    if (ahci_read_sector(target_sector, fs_dma_buf) == 0) {
+    if (blk_read_sector(target_sector, fs_dma_buf) == 0) {
         for (uint32_t b = 0; b < sizeof(disk_dnode_t); b++) {
             fs_dma_buf[offset_in_sector + b] = 0;
         }
-        ahci_write_sector(target_sector, fs_dma_buf);
+        blk_write_sector(target_sector, fs_dma_buf);
     }
 }
 
@@ -110,7 +117,13 @@ void fs_load_from_disk(Dnode** node) {
     if (!node) return;
     *node = 0;
 
-    if (ahci_read_sector(FS_START_SECTOR, fs_dma_buf) != 0) {
+    const pht_bootinfo_t* bi = blockdev_bootinfo();
+    if (bi && bi->fs_lba != FS_START_SECTOR) {
+        kprintw("fs: image header says FS starts at sector %d, kernel built for %d\n",
+                bi->fs_lba, FS_START_SECTOR);
+    }
+
+    if (blk_read_sector(FS_START_SECTOR, fs_dma_buf) != 0) {
         kprinte("Superblock read error\n");
         return;
     }
@@ -134,7 +147,7 @@ void fs_load_from_disk(Dnode** node) {
     if (!loaded_disk_nodes) return;
 
     for (uint32_t i = 0; i < node_sectors; i++) {
-        ahci_read_sector(FS_START_SECTOR + 1 + i, ((char*)loaded_disk_nodes) + (i * 512));
+        blk_read_sector(FS_START_SECTOR + 1 + i, ((char*)loaded_disk_nodes) + (i * 512));
     }
 
     Dnode** runtime_nodes = (Dnode**)kmalloc(total_nodes * sizeof(Dnode*));
@@ -178,7 +191,7 @@ void fs_load_from_disk(Dnode** node) {
             r->data = (char*)kmalloc(sectors_to_read * 512 + 1);
             if (r->data) {
                 for (uint32_t s = 0; s < sectors_to_read; s++) {
-                    ahci_read_sector(FS_START_SECTOR + d->data_block + s, r->data + (s * 512));
+                    blk_read_sector(FS_START_SECTOR + d->data_block + s, r->data + (s * 512));
                 }
                 r->data[d->size] = '\0';
             }

@@ -23,6 +23,7 @@ void memory_validate(void) {
     kprintd("AHCI:        0x%x - 0x%x (%d KB)\n", __PHT_MEM_AHCI_BASE, __PHT_MEM_AHCI_END, ahci_size/1024);
     kprintd("Malloc pool: 0x%x - 0x%x (%d KB)\n", __PHT_MEM_MALLOC_POOL, __PHT_MEM_MALLOC_END, malloc_pool_size/1024);
     kprintd("Handles:     0x%x - 0x%x (%d KB)\n", __PHT_MEM_HANDLES, __PHT_MEM_HANDLES_END, handles_size/1024);
+    kprintd("Boot disk:   0x%x - 0x%x (%d KB)\n", __PHT_MEM_BOOTDISK, __PHT_MEM_BOOTDISK_END, (__PHT_MEM_BOOTDISK_END - __PHT_MEM_BOOTDISK)/1024);
     
     // Compile-time assertions (using #error is already in memory_check.h)
     // Runtime checks:
@@ -34,7 +35,11 @@ void memory_validate(void) {
         // ERROR: sections overlap or gap exists
         while(1); // Halt
     }
-    if (__PHT_MEM_HANDLES_END != __PHT_MEM_USERSPACE) {
+    if (__PHT_MEM_HANDLES_END != __PHT_MEM_BOOTDISK) {
+        // ERROR: sections overlap or gap exists
+        while(1); // Halt
+    }
+    if (__PHT_MEM_BOOTDISK_END != __PHT_MEM_USERSPACE) {
         // ERROR: sections overlap or gap exists
         while(1); // Halt
     }

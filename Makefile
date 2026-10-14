@@ -1,6 +1,25 @@
 MAKEFLAGS += --no-print-directory
 
 BUILD_DIR := output/build
+IMAGE_DIR := $(BUILD_DIR)/image
+IMAGE := $(IMAGE_DIR)/os-image.bin
+ISO := $(IMAGE_DIR)/photon.iso
+
+# --- Раскладка образа диска (в 512-байтных секторах) -------------------------
+# Те же числа передаются в boot/bootsect.asm через -D (правило boot/bootsect.bin),
+# stage2 и ядро узнают их в рантайме из заголовка в MBR (boot/bootinfo.h).
+# stage2 занимает LBA 1..IMG_STAGE2_SECTORS
+IMG_STAGE2_SECTORS := 15
+# ядро (init.bin): LBA IMG_INIT_LBA, не больше IMG_INIT_SECTORS секторов
+IMG_INIT_LBA := 60
+IMG_INIT_SECTORS := 324
+# файловая система (fs.vd)
+IMG_FS_LBA := 384
+# полный размер образа (4096 * 512 = 2 МБ)
+IMG_SECTORS := 4096
+# куда грузить ядро и копию образа (ramdisk) при загрузке с CD/USB
+KERNEL_ADDR := 0x100000
+RAMDISK_ADDR := 0x1000000
 # Находим все C файлы
 C_SOURCES = $(wildcard kernel/*.c kernel/datslaf/*.c drivers/*.c cpu/*.c libc/*.c)
 # Находим все ASM файлы (интерфейсные, которые компилируются в .o)
@@ -25,19 +44,9 @@ COMMON_OBJ = $(BUILD_DIR)/libc/string.o \
 			 $(BUILD_DIR)/cpu/ports.o \
 			 $(BUILD_DIR)/cpu/malloc/kmalloc.o
 
-KERNEL_BRIDGE_OBJ = output/build/drivers/dumb-pci.o \
-					output/build/kernel/loader.o \
-					output/build/cpu/ports.o \
-					output/build/boot/kernel_entry.o
-					
-EXCLUDE_SRC = loader.c dumb-pci.c
-filtered_sources = $(filter-out $(EXCLUDE_SRC), $(C_SOURCES))
-
-# Формируем объекты
-INIT_OBJ := $(patsubst %.c,$(BUILD_DIR)/%.o,$(filtered_sources))
+# Формируем объекты ядра
+INIT_OBJ := $(patsubst %.c,$(BUILD_DIR)/%.o,$(C_SOURCES))
 INIT_OBJ += $(patsubst %.asm,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
-INIT_OBJ := $(filter-out $(BUILD_DIR)/drivers/dumb-pci.o, $(INIT_OBJ))
-INIT_OBJ := $(filter-out $(BUILD_DIR)/kernel/loader.o, $(INIT_OBJ))
 INIT_OBJ += $(BUILD_DIR)/cpu/malloc/kmalloc.o
 
 ifeq ("$(wildcard /c/msys64/usr/lib/gcc/x86_64-pc-msys/13.3.0/include)","")
@@ -67,6 +76,20 @@ else
 	endif
 endif
 
+# Ядру нужно знать раскладку образа только как запасной вариант (если его
+# запустили без нашего загрузчика); обычно он берёт её из bootinfo.
+CFLAGS += -DFS_START_SECTOR=$(IMG_FS_LBA)
+
+# --- QEMU --------------------------------------------------------------------
+# Под WSL используем Windows-сборку QEMU (как раньше), иначе системную.
+ifneq ("$(wildcard /mnt/c/Program*/qemu/qemu-system-x86_64.exe)","")
+	QEMU := "/mnt/c/Program Files/qemu/qemu-system-x86_64.exe"
+	QEMU_FLAGS := -cpu max -m 64M -serial stdio -display sdl
+else
+	QEMU := qemu-system-x86_64
+	QEMU_FLAGS := -cpu max -m 64M -serial stdio
+endif
+
 auto:
 	@$(MAKE) cycle
 
@@ -81,34 +104,65 @@ info:
 	@printf "\033[107;30m OBJC: ${OBJC} \033[0m\n"
 	@printf "\033[107;30m NM: ${NM} \033[0m\n"
 
-# First rule is run by default
-os-image.bin: boot/bootsect.bin kernel.bin init.bin build_vd
-	@printf "\033[107;30m Building aligned image... \033[0m\n"
-	@dd if=/dev/zero of=$@ bs=512 count=128 > /dev/null
-	@dd if=boot/bootsect.bin of=$@ conv=notrunc bs=512 seek=0 2> /dev/null
-	@dd if=kernel.bin of=$@ conv=notrunc bs=512 seek=1 2> /dev/null
-	@dd if=init.bin of=$@ conv=notrunc bs=512 seek=60 2> /dev/null
-	@dd if=kernel/datslaf/fs.vd of=$@ conv=notrunc bs=512 seek=384 2> /dev/null
-	@-mkdir -p output/build/image
-	@head -c 524288 /dev/zero | LC_ALL=C tr "\x00" "\x5f" >output/build/disk2.bin
-	@mv os-image.bin output/build/image/os-image.bin
-	@truncate -s 2M output/build/image/os-image.bin
-	@cat output/build/image/os-image.bin | sha256sum > output/build/sha256.txt
+# Образ диска: MBR(stage1) | stage2 | ... | init.bin | fs.vd  (см. docs/BOOT.md)
+.PHONY: os-image.bin iso check_bootinfo test_boot test_blkdev test
+os-image.bin: $(IMAGE)
+
+$(IMAGE): boot/bootsect.bin boot/stage2.bin init.bin build_vd tools/mkimage.py
+	@printf "\033[107;30m Building image... \033[0m\n"
+	@python3 tools/check_bootinfo.py
+	@mkdir -p $(IMAGE_DIR)
+	@python3 tools/mkimage.py --out $@ --sectors $(IMG_SECTORS) \
+		--part boot/bootsect.bin@0:1 \
+		--part boot/stage2.bin@1:$(IMG_STAGE2_SECTORS) \
+		--part init.bin@$(IMG_INIT_LBA):$(IMG_INIT_SECTORS) \
+		--part kernel/datslaf/fs.vd@$(IMG_FS_LBA):
+	@head -c 524288 /dev/zero | LC_ALL=C tr "\x00" "\x5f" >$(BUILD_DIR)/disk2.bin
+	@cat $@ | sha256sum > $(BUILD_DIR)/sha256.txt
+
+# Загрузочный ISO (CD-ROM + гибридный MBR для записи на флешку через dd)
+iso: $(ISO)
+$(ISO): $(IMAGE) tools/mkiso.py
+	@printf "\033[107;30m Building bootable ISO... \033[0m\n"
+	@python3 tools/mkiso.py --image $(IMAGE) --out $@
+
+# --- Тесты загрузчика и драйверов без QEMU ----------------------------------------
+# Проверка согласованности boot/bootinfo.h и boot/bootinfo.inc
+check_bootinfo:
+	@python3 tools/check_bootinfo.py
+
+# Прогон загрузчика в Unicorn (pip install unicorn): HDD/CHS/CD/USB-ISO
+test_boot: os-image.bin iso
+	@python3 tools/boottest.py --image $(IMAGE) --iso $(ISO) --mode all
+
+# Хост-тест drivers/ata.c + blockdev.c + ramdisk.c на эмуляторе IDE-контроллера
+BLKDEV_TEST := $(BUILD_DIR)/blkdev_test
+test_blkdev: os-image.bin iso
+	@mkdir -p $(BUILD_DIR)
+	@gcc -no-pie -O1 -g -I. -fno-builtin -w -DATA_HOST_TEST -DPHT_BOOTINFO_ADDR=0x20000 \
+		drivers/ata.c drivers/blockdev.c drivers/ramdisk.c \
+		tools/blkdev_test/test.c tools/blkdev_test/sim.c -o $(BLKDEV_TEST)
+	@for s in hdd cd cd-nord usb usb-iso legacy nodisk cdonly; do \
+		SIM_QUIET=1 $(BLKDEV_TEST) $$s $(IMAGE) $(ISO) || exit 1; \
+	done
+
+test: test_boot test_blkdev
+
+# stage1 получает раскладку образа через -D, stage2 читает её из MBR
+boot/bootsect.bin: boot/bootsect.asm boot/bootinfo.inc
+	@printf "  ASM\t$<              \n"
+	@nasm $< -f bin -o $@ -w+number-overflow -w+other \
+		-DIMG_STAGE2_SECTORS=$(IMG_STAGE2_SECTORS) -DIMG_INIT_LBA=$(IMG_INIT_LBA) \
+		-DIMG_INIT_SECTORS=$(IMG_INIT_SECTORS) -DIMG_FS_LBA=$(IMG_FS_LBA) \
+		-DIMG_SECTORS=$(IMG_SECTORS) -DKERNEL_ADDR=$(KERNEL_ADDR) -DRAMDISK_ADDR=$(RAMDISK_ADDR)
+
+boot/stage2.bin: boot/bootinfo.inc
 
 padding.bin:
 	@head -c 131072 /dev/zero | LC_ALL=C tr "\x00" "\x5f" >padding.bin
 
 buildinfo:
 	@echo '#define BUILD_DATE "PhotonOS build at ${DATE}"' > buildinfo.h
-
-# 3. Правило сборки kernel.bin (Мост)
-kernel.bin: $(KERNEL_BRIDGE_OBJ)
-	@printf "\033[0m  LD    bridge,\t$@              \n"
-	@${LD} -no-pie --oformat=binary -T kernel.ld -o $@ $^
-	
-kernel.elf: $(KERNEL_BRIDGE_OBJ)
-	@printf "\033[0m  LD    bridge,\t$@              \n"
-	@${LD}  --oformat=binary -T kernel.ld -o $@ $^
 
 init.bin: $(INIT_OBJ)
 	@printf "\033[0m  LD    init,\t$@              \n"
@@ -136,14 +190,35 @@ update:
 setup:
 	@-mkdir -p image
 
+# SATA (AHCI) диск — как раньше
 run: os-image.bin
-	@"/mnt/c/Program Files/qemu/qemu-system-x86_64.exe" \
-		-drive id=disk,file=output/build/image/os-image.bin,if=none,format=raw \
+	@$(QEMU) $(QEMU_FLAGS) \
+		-drive id=disk,file=$(IMAGE),if=none,format=raw \
 		-device ahci,id=ahci \
-		-cpu max \
-		-device ide-hd,drive=disk,bus=ahci.0 \
- 		-serial stdio \
-		-display sdl
+		-device ide-hd,drive=disk,bus=ahci.0
+
+# Классический IDE (PATA) диск
+run_ide: os-image.bin
+	@$(QEMU) $(QEMU_FLAGS) \
+		-drive file=$(IMAGE),format=raw,if=ide,index=0,media=disk
+
+# Загрузка с CD-ROM (IDE ATAPI)
+run_cdrom: iso
+	@$(QEMU) $(QEMU_FLAGS) -boot d -cdrom $(ISO)
+
+# USB-флешка с сырым образом (BIOS видит её как USB-HDD, ядро работает с ramdisk)
+run_usb: os-image.bin
+	@$(QEMU) $(QEMU_FLAGS) \
+		-drive if=none,id=usbstick,file=$(IMAGE),format=raw \
+		-device qemu-xhci,id=xhci \
+		-device usb-storage,bus=xhci.0,drive=usbstick
+
+# USB-флешка, на которую записан гибридный ISO (dd if=photon.iso of=/dev/sdX)
+run_usb_iso: iso
+	@$(QEMU) $(QEMU_FLAGS) \
+		-drive if=none,id=usbstick,file=$(ISO),format=raw \
+		-device qemu-xhci,id=xhci \
+		-device usb-storage,bus=xhci.0,drive=usbstick
 
 #-audiodev pa,id=snd0,server=/mnt/wslg/PulseServer,out.latency=50000,out.buffer-length=100000 \
 
@@ -151,14 +226,14 @@ run_alt:
 	@qemu-system-x86_64 -hda output/build/disk2.bin -m 64M -soundhw pcspk
 
 run_debug: os-image.bin
-	@qemu-system-x86_64 -drive file=output/build/os-image.bin,format=raw,index=0,media=disk -soundhw pcspk -m 64M
+	@qemu-system-x86_64 -drive file=$(IMAGE),format=raw,index=0,media=disk -soundhw pcspk -m 64M
 
 run_floppy: os-image.bin
-	@ndisasm -i output/build/os-image.bin 1> disasm.txt
-	@qemu-system-x86_64 -fda output/build/os-image.bin -d trace:fdc_ioport_read,trace:fdc_ioport_write,trace:dma_blk_io,trace:dma_aio_cancel,trace:dma_complete,trace:dma_blk_cb,trace:dma_map_wait
+	@ndisasm -i $(IMAGE) 1> disasm.txt
+	@qemu-system-x86_64 -fda $(IMAGE) -d trace:fdc_ioport_read,trace:fdc_ioport_write,trace:dma_blk_io,trace:dma_aio_cancel,trace:dma_complete,trace:dma_blk_cb,trace:dma_map_wait
 
-debug: os-image.bin kernel.elf
-	@qemu-system-i386 -s -drive file=os-image.bin,format=raw -d guest_errors,int &
+debug: os-image.bin init.elf
+	@qemu-system-i386 -s -drive file=$(IMAGE),format=raw -d guest_errors,int &
 
 compile_c: ${OBJ}
 	@printf "  CCs\t${FILE}              \n"

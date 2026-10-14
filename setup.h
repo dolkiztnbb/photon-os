@@ -42,8 +42,15 @@
 #define __PHT_MEM_HANDLES        __PHT_MEM_MALLOC_END
 #define __PHT_MEM_HANDLES_END   0x1000000
 
+// Boot disk image copy (ramdisk). When booting from CD-ROM or USB the
+// bootloader (boot/stage2.asm) copies the whole os-image here and the kernel
+// uses it as the root block device "rd0" (drivers/ramdisk.c). Must match
+// RAMDISK_ADDR in the Makefile. 4 MB reserved, image is 2 MB.
+#define __PHT_MEM_BOOTDISK      __PHT_MEM_HANDLES_END     // 0x1000000 (16 MB)
+#define __PHT_MEM_BOOTDISK_END  0x1400000                 // 20 MB
+
 // User space
-#define __PHT_MEM_USERSPACE     __PHT_MEM_HANDLES_END
+#define __PHT_MEM_USERSPACE     __PHT_MEM_BOOTDISK_END
 #define __PHT_MEM_END           0x10000000
 
 // ============================================================

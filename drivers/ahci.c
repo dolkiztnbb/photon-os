@@ -173,6 +173,7 @@ volatile hba_mem_t* __pht_hba=0;
 // --- ТОЧКА ВХОДА ИЗ ВАШЕГО ЯДРА ---
 
 uint8_t initialize_ahci_and_read(uint32_t abar) {
+    if (abar == 0) return 2;   // контроллера нет (IDE-only машина, USB, CD...) — раньше тут был NULL deref
     volatile hba_mem_t *hba = (hba_mem_t*)(uintptr_t)abar;
     
     // 1. Ищем порт
@@ -189,7 +190,7 @@ uint8_t initialize_ahci_and_read(uint32_t abar) {
         }
     }
 
-    if (port_idx == -1) return -1; // Диск не найден
+    if (port_idx == -1) return 2; // Диск не найден
 
     hba->ghc |= (1 << 31); // AE (AHCI Enable)
 
@@ -219,17 +220,15 @@ uint8_t initialize_ahci_and_read(uint32_t abar) {
     }
     port_start(port);
 
-    // 3. ЧТЕНИЕ СЕКТОРА
+    // 3. ПРОБНОЕ ЧТЕНИЕ СЕКТОРА 0 (дважды — после сброса первая команда иногда теряется)
     uint16_t *buf = (uint16_t*)__PHT_MEM_AHCI_BUFFER; // Куда читать (4MB)
     if (ahci_read(port, 0, 0, 1, buf)) {
 	    kprintd("Pass 1: Read OK %x\n",port_idx);
         if(ahci_read(port, 0, 0, 1, buf)){
             kprintd("Pass 2: Read OK %x\n",port_idx);
-            // Успех! В buf[0] и buf[1] лежат первые байты вашего MBR (должны быть инструкции или данные)
-            // Если это MBR, то buf[255] должен быть 0xAA55
-            if (buf[255] == 0xAA55 && buf[253] == 0x3003) {
-                return 0;
-            }
+            // Диск читается. Чей это диск (наш образ или чужой) — решает
+            // drivers/blockdev.c, сравнивая сектор с MBR из bootinfo.
+            return 0;
         }
     }
     return 1;

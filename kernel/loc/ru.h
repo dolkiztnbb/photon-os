@@ -20,13 +20,14 @@ const char LOC_KERNEL_FILES_CURRENT_DIRECTORY_LIKE[] = "Каталог %s (как root):\n
 
 // help category
 
-const char LOC_KERNEL_CMD_HELP [] = "исп.: help [auto cd charmap dir exit list load loadfont ls lspci lst mem mk run touch zombies exit]\n";
+const char LOC_KERNEL_CMD_HELP [] = "исп.: help [auto cd charmap dir exit list load loadfont ls lsblk lspci lst mem mk run touch zombies exit]\n";
 
 const char LOC_KERNEL_CMD_LIST [] = "LIST: показать все файлы в каталоге\nСинонимы:\n- ls\n- dir\n";
 const char LOC_KERNEL_CMD_LOAD [] = "LOAD <file>: загрузить файл в исполняемую память\n";
 const char LOC_KERNEL_CMD_RUN [] = "RUN: запустить файл, загруженный командой LOAD\n";
 const char LOC_KERNEL_CMD_AUTO [] = "AUTO: загрузить 'init' с диска и запустить его\n";
 const char LOC_KERNEL_CMD_LSPCI [] = "LSPCI: показать все устройства PCI\n";
+const char LOC_KERNEL_CMD_LSBLK [] = "LSBLK: показать блочные устройства (SATA/IDE/CD-ROM/ramdisk) и загрузочное\n";
 const char LOC_KERNEL_CMD_CHARMAP [] = "CHARMAP: показать карту символов\n";
 const char LOC_KERNEL_CMD_ZOMBIES [] = "ZOMBIES: создать зомби\n";
 const char LOC_KERNEL_CMD_CD [] = "CD: изменить текущий каталог\n";

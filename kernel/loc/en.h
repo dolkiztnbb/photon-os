@@ -21,13 +21,14 @@ const char LOC_KERNEL_FILES_CURRENT_DIRECTORY_LIKE[] = "Directory %s (root-like)
 
 // help category
 
-const char LOC_KERNEL_CMD_HELP [] = "use: help [auto cd charmap dir exit list load loadfont ls lspci lst memleak mk run touch zombies exit]\n";
+const char LOC_KERNEL_CMD_HELP [] = "use: help [auto cd charmap dir exit list load loadfont ls lsblk lspci lst memleak mk run touch zombies exit]\n";
 
 const char LOC_KERNEL_CMD_LIST [] = "LIST: display all files in the root directory\nAliases:\n- ls\n- dir\n";
 const char LOC_KERNEL_CMD_LOAD [] = "LOAD <file>: load file into executable memory\n";
 const char LOC_KERNEL_CMD_RUN [] = "RUN: run the file loaded with the LOAD command\n";
 const char LOC_KERNEL_CMD_AUTO [] = "AUTO: load 'init' from the disk and run it\n";
 const char LOC_KERNEL_CMD_LSPCI [] = "LSPCI: display all PCI devices\n";
+const char LOC_KERNEL_CMD_LSBLK [] = "LSBLK: display block devices (SATA/IDE/CD-ROM/ramdisk) and the boot device\n";
 const char LOC_KERNEL_CMD_CHARMAP [] = "CHARMAP: display the character map\n";
 const char LOC_KERNEL_CMD_ZOMBIES [] = "ZOMBIES: create zombies\n";
 const char LOC_KERNEL_CMD_CD [] = "CD: change to a different directory\n";

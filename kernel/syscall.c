@@ -5,6 +5,7 @@
 #include <drivers/screen.h>
 #include <cpu/timer.h>
 #include <cpu/mt.h>
+#include <drivers/blockdev.h>
 
 extern uint32_t page_directory[1024];
 static uint8_t bcd_to_bin(uint8_t val) {
@@ -462,14 +463,16 @@ void int80h(registers_t *r) {
         }
 
         // ==========================================
-        // ПРИВИЛЕГИРОВАННЫЕ ДИСК И PCI (БЕЗ ИЗМЕНЕНИЙ)
+        // ПРИВИЛЕГИРОВАННЫЕ ДИСК И PCI
+        // (сектор отсчитывается от начала образа ОС на том устройстве,
+        //  с которого загрузились: SATA, IDE, CD-ROM или копия в ОЗУ)
         // ==========================================
         case SYS_AHCI_READ:
-            ret = ahci_read_sector((uint32_t)arg1, (char*)arg2);
+            ret = blk_read_sector((uint32_t)arg1, (char*)arg2);
             break;
 
         case SYS_AHCI_WRITE:
-            ret = ahci_write_sector((uint32_t)arg1, (const char*)arg2);
+            ret = blk_write_sector((uint32_t)arg1, (const char*)arg2);
             break;
 
         case SYS_PCI_READ:
