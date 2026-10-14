@@ -1,0 +1,74 @@
+=-=-=-=-=-=-=-=-=-=
+
+dnode_create_at_path(Dnode* root, Dnode* cwd, const char* full_path, uint8_t type) -> Dnode*
+
+    Creates a TYPE_DIR/TYPE_FILE at the full_path
+    Returns:
+    1.  the pointer to the node in the RAM,
+    2.  NULL if something went wrong.
+
+    root - The root directory
+    cwd - from Current Working directory
+    full_path - Full path to the file
+    type - Either TYPE_DIR or a TYPE_FILE
+
+Use case:
+
+    Dnode* config = dnode_create_at_path(root, NULL, "/sys/conf.ini", TYPE_FILE); // returns a pointer to the created file
+
+    // Quick sanity check
+
+    Dnode*  sys = DFC(root,"sys");
+    if( DFC(sys, "conf.ini") != 0 ) {
+        kprintd("All fine");
+    } else {
+        kprintw("Something went wrong");
+    }
+
+=-=-=-=-=-=-=-=-=-=
+
+dnode_find_by_path(Dnode* root, Dnode* cwd, const char* path) -> Dnode* 
+
+    Finds the node at the path.
+    Returns:
+    1.  the pointer to the node in the RAM,
+    2.  NULL if something went wrong.
+
+    root - The root directory
+    cwd - from Current Working directory
+    full_path - Full path to the file
+
+Use case:
+
+    Dnode* config = dnode_find_by_path(root, NULL, "/sys/conf.ini"); // returns a pointer to the found file
+
+    if ( config != 0 ) {
+        kprintd("All fine");
+    } else {
+        kprintw("Something went wrong");
+    }
+
+
+=-=-=-=-=-=-=-=-=-=
+
+kopen(const char* path, char flags)                     -> uint32_t
+kwrite(int32_t fd, const char* data, uint32_t size)     -> uint32_t
+kread(int32_t fd, char* source, uint32_t size)          -> uint32_t
+kseek(int32_t fd, int32_t offset, int whence)           -> uint32_t
+kclose(int32_t fd)                                      -> uint32_t
+
+void kquery(int32_t fd, FILE_QUERY* query)              -> FILE_QUERY
+
+    Basic file manipulation through handles.
+    Returns:
+        kopen - file handles
+        kwrite - bytes written
+        kread - bytes read
+        kseek
+        kquery - get file info in a struct (ref. kernel/files.h)
+
+Use case:
+
+	uint32_t fd = kopen("/test", CREATE | WRITE | TRUNCATE);
+	kwrite(fd, "Hello world", 12);
+	kclose(fd);

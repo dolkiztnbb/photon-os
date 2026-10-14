@@ -1,0 +1,88 @@
+#include "../../drivers/mouse.h"
+
+#define min(a , b) ((a)<(b)?(a):(b));
+#define a_p(x) print(font,x,0xf,2);
+#define a_d(x) print(font,x,0x9,2);
+#define a_e(x) print(font,x,0xc,2);
+#define a_w(x) print(font,x,0xd,2);
+
+void TODO(char[]x){
+	a_w("[TODO]: ");
+	a_p(x);
+	a_p("\n");
+}
+
+int main(){
+    char m[128];
+    char p[2];
+    char n;
+    setspacing(5,7);
+    a_d("this is how debug will look like\n");
+    a_e("this is how errors will look like\n");
+    a_w("this is how warnings will look like\n");
+    a_p("---------------------------------------\n");
+    TODO("mouse");
+    TODO("fix keyboard");
+    TODO("full kernel commands");
+    TODO("DE")
+y\sim ax^{4}+bx^{3}+cx^{2}+dx+f;
+    while(1){
+        print(font,"kernel >",0xf,2);
+        wtc();
+        getline(m);
+        print(font,"\n",0xf,2);
+
+        if(strcmp(m,"int")==0){
+            print(font,"Mode: [(a)dd (s)ubstract (m)ultiply (d)ivide] ",0x7,2);
+            volatile size_t b;
+            volatile size_t a;
+            double c;
+            while(getkey()==0);
+            n = getkey();
+            clear(m,128);
+            m[0]=n;
+            p[0]=n;
+            print(font,m,0xf,2);
+            print(font,"\nNumber A: ",0x7,2);
+            wtc();
+            getline(m);
+            a = atoi(m);
+            print(font,"",0x0,0);
+            wtc();
+            print(font,"\nNumber B: ",0x7,2); // Выводим приглашение для B
+            wtc();
+            getline(m); // Ввод B
+            b = atoi(m); // Сохраняем B в `b`
+            print(font,"\n",0xf,2);
+            print(font,"Result:\n",0x7,2);
+            print(font,"          >",0x7,2);
+            if(p[0]=='A'){
+                print_int(font,a+b,0xf,2);
+            }
+            else if(p[0]=='S'){
+                print_int(font,a-b,0xf,2);
+            }
+            else if(p[0]=='D'){
+                print_float(font,(double)(a)/(double)(b),0xf,2);
+            }
+            else if(p[0]=='M'){
+                print_float(font,(double)(a)*(double)(b),0xf,2);
+            }
+            
+            print(font,"<\n",0x7,2);
+        }else if(strcmp("fetch",m)==0){
+		setspacing(5,8);
+		a_p(".''.... ''''''''''''''''''''''''''.\n");
+		a_p("'..'   '.    PhotonOS on x86      :\n");
+		a_p(" :       :   Written by Kamanodzu :\n");
+		a_p(" '.    .''.            & 039bb    :\n");
+		a_p("   '...'..'.......................'\n");
+		setspacing(5,7);
+	}else if(strlen(m)!=0){
+		print(font,"unknown command ",0x7,2);
+		print(font,m,0xf,2);
+		print(font,"\n",0xf,2);
+	}
+    }
+    
+}
