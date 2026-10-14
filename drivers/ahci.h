@@ -1,3 +1,6 @@
+#ifndef AHCI_H
+#define AHCI_H
+
 #include <stdint.h>
 #include <cpu/ports.h> // ваши функции in/out
 
@@ -75,9 +78,14 @@ int ahci_write(volatile hba_port_t *port, uint32_t lba_low, uint32_t lba_high, u
 
 // --- ТОЧКА ВХОДА ИЗ ВАШЕГО ЯДРА ---
 
+// Инициализирует первый SATA-диск контроллера и пробует прочитать сектор 0.
+// Возвращает 0 — диск готов, 1 — диск есть, но чтение не удалось,
+// 2 — контроллера/диска нет (abar == 0 или ни одного порта с устройством).
 uint8_t initialize_ahci_and_read(uint32_t abar) ;
 
 uint8_t ahci_read_sector(uint32_t lba, char* buffer) ;
 
 // Функция-обертка для записи одного сектора (аналогично вашей ahci_read_sector)
 uint8_t ahci_write_sector(uint32_t lba, const char* buffer) ;
+
+#endif /* AHCI_H */

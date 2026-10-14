@@ -15,7 +15,7 @@
 #include <kernel/files.h>
 // #include <kernel/microfs.h>
 #include <drivers/pci.h>
-#include <drivers/ahci.h>
+#include <drivers/blockdev.h>
 #include <kernel/pex/header.h>
 #include <kernel/pex/loader.c> // <-------- kill this
 #include <drivers/vgarom.h>
@@ -86,7 +86,16 @@ char runas[] = "kernel";
 
 void main(void *arg);
 
+// Границы .bss из init.ld
+extern char __bss_start[];
+extern char __bss_end[];
+
 void __attribute__((section(".text.main"))) init(){
+	// Загрузчик кладёт в память только init.bin (.text + .data); секцию .bss
+	// никто не обнуляет, и на реальном железе статические переменные стартовали
+	// бы с мусором. Делаем это первым делом, до любого обращения к ним.
+	memory_set(__bss_start, 0, (uint32_t)(__bss_end - __bss_start));
+
 	kprintd("Load OK\n");
     cls(0x000f);
     // Let user know that we are here
@@ -113,10 +122,12 @@ void main(void *arg){
     kprintd("Initializing paging...\n");
     init_paging();	
 
-    // 2. И только ПОТОМ сканируем PCI, маппим ABAR и читаем диск
-    kprintd("Initializing PCI & AHCI...\n");
-    uint32_t abar = pci_scan_bus();
-    initialize_ahci_and_read(abar);
+    // 2. И только ПОТОМ ищем диски (AHCI / IDE / ATAPI / ramdisk) и выбираем
+    //    тот, с которого нас загрузили (см. drivers/blockdev.c)
+    kprintd("Initializing block devices...\n");
+    if (blockdev_init_boot() != 0) {
+        kprinte("No boot device: filesystem will be unavailable\n");
+    }
 
     char line[64]={};
     char command[64] = {};
@@ -126,7 +137,10 @@ void main(void *arg){
 
     Dnode* ramfs_root = kmalloc(sizeof(Dnode));
     fs_load_from_disk(&ramfs_root);
-    kprintd("Filesystem (%x) loaded, root has %d children\n", ramfs_root, ramfs_root->children->size);
+    if (ramfs_root && ramfs_root->children)
+        kprintd("Filesystem (%x) loaded, root has %d children\n", ramfs_root, ramfs_root->children->size);
+    else
+        kprinte("Filesystem not loaded (see messages above, try 'lsblk')\n");
 
 #ifdef __PHT_TEXTMODE__
     kprintw(LOC_KERNEL_NO_GRAPHICS);
@@ -243,6 +257,9 @@ void main(void *arg){
 			}
 			else if(EQ(command,"lspci")){
 				kprintf(font,0x0007,2,LOC_KERNEL_CMD_LSPCI);
+			}
+			else if(EQ(command,"lsblk")){
+				kprintf(font,0x0007,2,LOC_KERNEL_CMD_LSBLK);
 			}
 			else if(EQ(command,"charmap")){
 				kprintf(font,0x0007,2,LOC_KERNEL_CMD_CHARMAP);
@@ -418,6 +435,9 @@ void main(void *arg){
 		}
 		else if(EQ(command,"lspci")){
 			pci_scan();
+		}
+		else if(EQ(command,"lsblk")){
+			blockdev_print();
 		}
 		else if(EQ(command,"memleak")){
 			kmalloc(64*1024);

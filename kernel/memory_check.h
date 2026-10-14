@@ -29,8 +29,12 @@
     #error "MEMORY LAYOUT ERROR: MALLOC_END does not match HANDLES start!"
 #endif
 
-#if (__PHT_MEM_HANDLES_END != __PHT_MEM_USERSPACE)
-    #error "MEMORY LAYOUT ERROR: HANDLES_END does not match USERSPACE start!"
+#if (__PHT_MEM_HANDLES_END != __PHT_MEM_BOOTDISK)
+    #error "MEMORY LAYOUT ERROR: HANDLES_END does not match BOOTDISK start!"
+#endif
+
+#if (__PHT_MEM_BOOTDISK_END != __PHT_MEM_USERSPACE)
+    #error "MEMORY LAYOUT ERROR: BOOTDISK_END does not match USERSPACE start!"
 #endif
 
 #if (__PHT_MEM_USERSPACE + USERSPACE_SIZE != __PHT_MEM_END)

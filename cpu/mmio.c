@@ -26,9 +26,12 @@ static uint8_t in_handler = 0;
 // Выравниваем структуры по границе 4 КБ
 #define PAGE_SIZE 4096
 
-// Мапируем первые 16 МБ памяти (4 таблицы по 1024 записи = 4096 страниц)
+// Мапируем первые 32 МБ памяти (8 таблиц по 1024 записи = 8192 страниц):
+// 0..16 МБ — ядро, AHCI, kmalloc; 16..20 МБ — копия загрузочного образа
+// (__PHT_MEM_BOOTDISK, нужна при загрузке с CD/USB), остальное — запас.
+#define IDENTITY_MAP_TABLES 8
 __attribute__((aligned(PAGE_SIZE))) uint32_t page_directory[1024];
-__attribute__((aligned(PAGE_SIZE))) uint32_t page_tables[4][1024];
+__attribute__((aligned(PAGE_SIZE))) uint32_t page_tables[IDENTITY_MAP_TABLES][1024];
 
 void init_paging(void) {
     // 1. Очищаем Page Directory
@@ -36,8 +39,8 @@ void init_paging(void) {
         page_directory[i] = 0x00000002; // Not Present, Read/Write
     }
 
-    // 2. Заполняем 4 таблицы страниц (Identity Map: 0x00000000 - 0x00FFFFFF)
-    for (int t = 0; t < 4; t++) {
+    // 2. Заполняем таблицы страниц (Identity Map: 0x00000000 - 0x01FFFFFF)
+    for (int t = 0; t < IDENTITY_MAP_TABLES; t++) {
         for (int i = 0; i < 1024; i++) {
             uint32_t phys_addr = (t * 1024 + i) * PAGE_SIZE;
             page_tables[t][i] = phys_addr | 3; // Present | Writable
