@@ -110,12 +110,13 @@ static int ehci_exec_transfer(ehci_qh_t* qh, ehci_qtd_t* first_qtd, ehci_qtd_t* 
     ehci_write_op32(0x04, 0x3F);
 
     // Загружаем qTD в QH, сохраняя бит Data Toggle (бит 31)
+    qh->current_qtd = 0;
     qh->next_qtd = (uint32_t)first_qtd;
     qh->token &= ~0xFF; 
     
     ehci_write_op32(0x18, (uint32_t)qh);
 
-    ehci_write_op32(0x00, ehci_read_op32(0x00) | (1 << 5));
+    ehci_write_op32(0x00, ehci_read_op32(0x00) | (1 << 0) | (1 << 5));
     while (!(ehci_read_op32(0x04) & (1 << 5)));
 
     int status = -2; 
@@ -319,14 +320,14 @@ static int usb_init_mass_storage(void) {
     ehci_qh_t* qh_out = &qh_pool[1];
     memset(qh_out, 0, sizeof(ehci_qh_t));
     qh_out->qhlp = ((uint32_t)qh_out) | 0x02;
-    qh_out->ep_char = (usb_dev_addr & 0x7F) | ((ep_out & 0x0F) << 8) | (2 << 12) | (512 << 16);
+    qh_out->ep_char = (usb_dev_addr & 0x7F) | ((ep_out & 0x0F) << 8) | (2 << 12) | (1 << 14) | (512 << 16);
     qh_out->ep_cap = 0x40000000;
     qh_out->next_qtd = 1;
 
     ehci_qh_t* qh_in = &qh_pool[2];
     memset(qh_in, 0, sizeof(ehci_qh_t));
     qh_in->qhlp = ((uint32_t)qh_in) | 0x02;
-    qh_in->ep_char = (usb_dev_addr & 0x7F) | ((ep_in & 0x0F) << 8) | (2 << 12) | (512 << 16);
+    qh_in->ep_char = (usb_dev_addr & 0x7F) | ((ep_in & 0x0F) << 8) | (2 << 12) | (1 << 14) | (512 << 16);
     qh_in->ep_cap = 0x40000000;
     qh_in->next_qtd = 1;
 
@@ -433,6 +434,14 @@ void usb_init(void) {
     ehci_write_op32(0x10, 0); 
     ehci_write_op32(0x40, 1); 
     io_delay_ms(50);
+
+    /* Запускаем контроллер (Run/Stop = 1): без этого HC остаётся в halted-состоянии
+       и асинхронное расписание никогда не выполняется -> передачи «висят» до таймаута. */
+    ehci_write_op32(0x00, ehci_read_op32(0x00) | (1 << 0));
+    io_delay_ms(10);
+    for (int _i = 0; _i < 100 && (ehci_read_op32(0x04) & (1 << 12)); _i++) {
+        io_delay_ms(1);
+    }
 
     uint32_t hcsparams = *(volatile uint32_t*)(ehci_base + 0x04);
     uint32_t n_ports = hcsparams & 0x0F;
