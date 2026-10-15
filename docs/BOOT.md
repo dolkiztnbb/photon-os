@@ -44,11 +44,27 @@ sudo dd if=output/build/image/photon.iso  of=/dev/sdX bs=1M conv=fsync   # фл�
 
 ```
 LBA 0          MBR: stage1 (boot/bootsect.asm), заголовок образа, таблица разделов
-LBA 1..15      stage2 (boot/stage2.asm), до 7.5 КБ
-LBA 60..383    init.bin — ядро, до 162 КБ (324 сектора)
-LBA 384..      fs.vd — файловая система DATSLAF
+LBA 1..31      stage2 (boot/stage2.asm), до 15.5 КБ (поддержка загрузки ядра из ФС)
+LBA 60..383    init.bin — ядро, до 162 КБ (324 сектора) — fallback, основное ядро теперь в /sys/kernel/
+LBA 384..      fs.vd — файловая система DATSLAF (содержит /sys/kernel/kernel.bin и версии)
 всего 4096     (2 МБ)
 ```
+
+Новая схема (v2): ядро хранится в ФС `/sys/kernel/`:
+
+- `kernel.bin` — текущее ядро (копия `init.bin` при сборке)
+- `kernel-1.0.0.bin`, `kernel-<date>.bin` — версионированные ядра
+- `boot.cfg` / `default` / `active` — текстовый файл с именем ядра для загрузки по умолчанию
+- `versions.txt`, `README.txt` — документация
+
+Stage2 теперь умеет:
+
+1. Читать DATSLAF напрямую (суперблок → таблица узлов → поиск `/sys/kernel`)
+2. Читать `boot.cfg` для выбора версии
+3. Показывать меню выбора, если несколько ядер
+4. Fallback на старый LBA-метод, если ФС не найдена
+
+См. `docs/KERNEL_VERSIONS.md`.
 
 Числа попадают:
 

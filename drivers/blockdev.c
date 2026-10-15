@@ -144,6 +144,7 @@ int blockdev_init_boot(void) {
 
     ahci_probe();
     ata_init();
+    usb_init();
     if (bootinfo_valid) ramdisk_init_from_bootinfo(&bootinfo_copy);
 
     boot_dev = 0;

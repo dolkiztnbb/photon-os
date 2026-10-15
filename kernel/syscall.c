@@ -256,7 +256,7 @@ void int80h(registers_t *r) {
 
         case SYS_EXIT:
             mt_exit_self_code((int)arg1);
-            while (1) { asm volatile("cli; hlt"  : : :  "memory"); }
+            while (1) { asm volatile("cli; hlt"); }
             break;
 
         case SYS_WAITPID:
@@ -296,7 +296,7 @@ void int80h(registers_t *r) {
             // Запасной способ через контроллер клавиатуры PS/2 (если 0xCF9 не сработал)
             port_byte_out(0x64, 0xFE);
 
-            while (1) { asm volatile("cli; hlt"  : : :  "memory"); }
+            while (1) { asm volatile("cli; hlt"); }
             ret = ERR_OK;
             break;
         case SYS_SETUID: {
@@ -380,13 +380,13 @@ void int80h(registers_t *r) {
             }
 
             // Атомарно забираем дельту и сбрасываем счетчики
-            asm volatile("cli"  : : :  "memory");
+            asm volatile("cli");
             int32_t dx = mouse_delta_x;
             int32_t dy = mouse_delta_y;
             uint8_t btn = mouse_buttons;
             mouse_delta_x = 0;
             mouse_delta_y = 0;
-            asm volatile("sti" : : : "memory");
+            asm volatile("sti");
 
             mouse_state_t* user_mouse = (mouse_state_t*)arg1;
             user_mouse->dx = dx;
@@ -462,18 +462,32 @@ void int80h(registers_t *r) {
             break;
         }
 
+        // БЕЗОПАСНАЯ РАБОТА С ДИСКАМИ (KERNEL BOUNCE BUFFER)
         // ==========================================
-        // ПРИВИЛЕГИРОВАННЫЕ ДИСК И PCI
-        // (сектор отсчитывается от начала образа ОС на том устройстве,
-        //  с которого загрузились: SATA, IDE, CD-ROM или копия в ОЗУ)
-        // ==========================================
-        case SYS_AHCI_READ:
-            ret = blk_read_sector((uint32_t)arg1, (char*)arg2);
+        case SYS_AHCI_READ: {
+            static char k_dma_buf[512] __attribute__((aligned(4)));
+            if (!arg2) { ret = -1; break; }
+            if (cur_task && cur_task->cr3 && !vmm_check_user_memory((uint32_t*)cr3, arg2, 512, 1)) {
+                ret = -1; break;
+            }
+            // Читаем в буфер ядра (физическая память < 16 МБ, 1:1 identity map)
+            ret = blk_read_sector((uint32_t)arg1, k_dma_buf);
+            if (ret == 0) {
+                memcpy((void*)arg2, k_dma_buf, 512);
+            }
             break;
+        }
 
-        case SYS_AHCI_WRITE:
-            ret = blk_write_sector((uint32_t)arg1, (const char*)arg2);
+        case SYS_AHCI_WRITE: {
+            static char k_dma_buf[512] __attribute__((aligned(4)));
+            if (!arg2) { ret = -1; break; }
+            if (cur_task && cur_task->cr3 && !vmm_check_user_memory((uint32_t*)cr3, arg2, 512, 0)) {
+                ret = -1; break;
+            }
+            memcpy(k_dma_buf, (const void*)arg2, 512);
+            ret = blk_write_sector((uint32_t)arg1, k_dma_buf);
             break;
+        }
 
         case SYS_PCI_READ:
             ret = pci_read_config_32((uint8_t)arg1, (uint8_t)arg2, (uint8_t)arg3, (uint8_t)arg4);
@@ -488,6 +502,85 @@ void int80h(registers_t *r) {
             ret = pci_scan_bus();
             break;
 
+        case SYS_DEV_COUNT:
+            ret = blockdev_count();
+            break;
+
+        case SYS_DEV_INFO: {
+            int idx = (int)arg1;
+            disk_info_t* u_info = (disk_info_t*)arg2;
+            if (!u_info || idx < 0 || idx >= blockdev_count()) {
+                ret = -1; break;
+            }
+            if (cur_task && cur_task->cr3 && !vmm_check_user_memory((uint32_t*)cr3, arg2, sizeof(disk_info_t), 1)) {
+                ret = -1; break;
+            }
+            blockdev_t* dev = blockdev_get(idx);
+            if (!dev) { ret = -1; break; }
+
+            disk_info_t kinfo;
+            memset(&kinfo, 0, sizeof(kinfo));
+            strncpy(kinfo.name, dev->name, sizeof(kinfo.name) - 1);
+            strncpy(kinfo.model, dev->model, sizeof(kinfo.model) - 1);
+            kinfo.total_sectors = dev->total_sectors;
+            kinfo.sector_size = dev->sector_size;
+            kinfo.flags = dev->flags;
+            kinfo.is_boot = (dev == blockdev_boot());
+
+            memcpy(u_info, &kinfo, sizeof(disk_info_t));
+            ret = 0;
+            break;
+        }
+
+        case SYS_DEV_READ: {
+            static char k_dma_buf[512] __attribute__((aligned(4)));
+            int idx = (int)arg1;
+            uint32_t lba = (uint32_t)arg2;
+            void* u_buf = (void*)arg3;
+
+            if (!u_buf || idx < 0 || idx >= blockdev_count()) {
+                ret = -1; break;
+            }
+            if (cur_task && cur_task->cr3 && !vmm_check_user_memory((uint32_t*)cr3, (uintptr_t)u_buf, 512, 1)) {
+                ret = -1; break;
+            }
+            blockdev_t* dev = blockdev_get(idx);
+            if (!dev || !dev->read) {
+                ret = -1; break;
+            }
+            ret = dev->read(dev, lba, k_dma_buf);
+            if (ret == 0) {
+                memcpy(u_buf, k_dma_buf, 512);
+            }
+            break;
+        }
+
+        case SYS_DEV_WRITE: {
+            static char k_dma_buf[512] __attribute__((aligned(4)));
+            // Запись разрешена только root
+            if (cur_task && cur_task->uid != 0) {
+                ret = -1; break;
+            }
+            int idx = (int)arg1;
+            uint32_t lba = (uint32_t)arg2;
+            const void* u_buf = (const void*)arg3;
+
+            if (!u_buf || idx < 0 || idx >= blockdev_count()) {
+                ret = -1; break;
+            }
+            if (cur_task && cur_task->cr3 && !vmm_check_user_memory((uint32_t*)cr3, (uintptr_t)u_buf, 512, 0)) {
+                ret = -1; break;
+            }
+
+            blockdev_t* dev = blockdev_get(idx);
+            if (!dev || (dev->flags & BLK_FLAG_READONLY) || !dev->write) {
+                ret = -1; break;
+            }
+            // Копируем из юзерспейса в память ядра, затем пишем
+            memcpy(k_dma_buf, u_buf, 512);
+            ret = dev->write(dev, lba, k_dma_buf);
+            break;
+        }
         default:
             kprinte("unhandled syscall 0x%X\n", syscall_num);
             ret = -1;

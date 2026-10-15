@@ -9,8 +9,8 @@
 BOOTINFO_ADDR       equ 0x0600      ; pht_bootinfo_t
 BOOTINFO_MAGIC      equ 0x544F4850  ; "PHOT"
 MBR_ADDR            equ 0x7C00      ; куда BIOS кладёт первый сектор
-IMAGE_HEAD_ADDR     equ 0x8000      ; копия первых 8 КБ образа (MBR + stage2)
-IMAGE_HEAD_BYTES    equ 8192
+IMAGE_HEAD_ADDR     equ 0x8000      ; копия первых 16 КБ образа (MBR + stage2)
+IMAGE_HEAD_BYTES    equ 16384
 STAGE2_ADDR         equ 0x8200      ; = IMAGE_HEAD_ADDR + 512, точка входа stage2
 BOUNCE_SEG          equ 0x1000      ; буфер 0x10000..0x1FFFF для int 13h
 BOUNCE_ADDR         equ 0x10000

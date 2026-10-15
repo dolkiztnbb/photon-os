@@ -96,7 +96,19 @@ typedef struct {
 // WILL BE DEPRECATED
 #define SYS_AHCI_READ    0x80 // Прямое чтение секторов LBA
 #define SYS_AHCI_WRITE   0x81 // Прямая запись секторов LBA
+#define SYS_DEV_COUNT    0x82
+#define SYS_DEV_INFO     0x83
+#define SYS_DEV_READ     0x84
+#define SYS_DEV_WRITE    0x85
 
+typedef struct {
+    char     name[8];
+    char     model[41];
+    uint32_t total_sectors;
+    uint32_t sector_size;
+    uint32_t flags;
+    uint8_t  is_boot;
+} disk_info_t;
 // ----------------------------------------------------------------------------
 // 8. Привилегированный доступ: PCI (0x90 - 0x9F)
 // ----------------------------------------------------------------------------

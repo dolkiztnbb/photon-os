@@ -8,8 +8,8 @@ ISO := $(IMAGE_DIR)/photon.iso
 # --- Раскладка образа диска (в 512-байтных секторах) -------------------------
 # Те же числа передаются в boot/bootsect.asm через -D (правило boot/bootsect.bin),
 # stage2 и ядро узнают их в рантайме из заголовка в MBR (boot/bootinfo.h).
-# stage2 занимает LBA 1..IMG_STAGE2_SECTORS
-IMG_STAGE2_SECTORS := 15
+# stage2 занимает LBA 1..IMG_STAGE2_SECTORS (увеличено для поддержки загрузки ядра из ФС)
+IMG_STAGE2_SECTORS := 31
 # ядро (init.bin): LBA IMG_INIT_LBA, не больше IMG_INIT_SECTORS секторов
 IMG_INIT_LBA := 60
 IMG_INIT_SECTORS := 324
@@ -177,8 +177,16 @@ $(MAP_OUTPUT): init.elf
 	@mkdir -p $(dir $@)
 	@python3 $(MAP_BUILDER) init.elf $@ $(NM)
 
-# Сборка .vd образа файловой системы с предварительным обновлением карты символов
-build_vd: $(MAP_OUTPUT)
+# Директория для хранения ядер внутри ФС 
+KERNEL_FS_DIR := $(FS_SOURCE_DIR)/sys/kernel
+
+# Сборка .vd образа файловой системы: только один рабочий kernel.bin
+build_vd: $(MAP_OUTPUT) init.bin
+	@printf "\033[107;30m Preparing /sys/kernel in filesystem... \033[0m\n"
+	@mkdir -p $(KERNEL_FS_DIR)
+	@rm -f $(KERNEL_FS_DIR)/kernel*.bin $(KERNEL_FS_DIR)/versions.txt $(KERNEL_FS_DIR)/default $(KERNEL_FS_DIR)/active
+	@cp init.bin $(KERNEL_FS_DIR)/kernel.bin
+# 	@echo "kernel.bin" > $(KERNEL_FS_DIR)/boot.cfg
 	@printf "\033[107;30m Building full filesystem .vd image... \033[0m\n"
 	@python3 ${FS_BUILDER} ${FS_SOURCE_DIR} kernel/datslaf/fs.vd
 
@@ -190,12 +198,13 @@ update:
 setup:
 	@-mkdir -p image
 
-# SATA (AHCI) диск — как раньше
 run: os-image.bin
 	@$(QEMU) $(QEMU_FLAGS) \
 		-drive id=disk,file=$(IMAGE),if=none,format=raw \
+		-drive id=target,file=disk_target.bin,if=none,format=raw \
 		-device ahci,id=ahci \
-		-device ide-hd,drive=disk,bus=ahci.0
+		-device ide-hd,drive=disk,bus=ahci.0,bootindex=1 \
+		-device ide-hd,drive=target,bus=ahci.1,bootindex=2
 
 # Классический IDE (PATA) диск
 run_ide: os-image.bin
@@ -206,19 +215,19 @@ run_ide: os-image.bin
 run_cdrom: iso
 	@$(QEMU) $(QEMU_FLAGS) -boot d -cdrom $(ISO)
 
-# USB-флешка с сырым образом (BIOS видит её как USB-HDD, ядро работает с ramdisk)
+# USB-флешка с сырым образом (USB 2.0 EHCI)
 run_usb: os-image.bin
 	@$(QEMU) $(QEMU_FLAGS) \
 		-drive if=none,id=usbstick,file=$(IMAGE),format=raw \
-		-device qemu-xhci,id=xhci \
-		-device usb-storage,bus=xhci.0,drive=usbstick
+		-device usb-ehci,id=ehci \
+		-device usb-storage,bus=ehci.0,drive=usbstick
 
-# USB-флешка, на которую записан гибридный ISO (dd if=photon.iso of=/dev/sdX)
+# USB-флешка с гибридным ISO
 run_usb_iso: iso
 	@$(QEMU) $(QEMU_FLAGS) \
 		-drive if=none,id=usbstick,file=$(ISO),format=raw \
-		-device qemu-xhci,id=xhci \
-		-device usb-storage,bus=xhci.0,drive=usbstick
+		-device usb-ehci,id=ehci \
+		-device usb-storage,bus=ehci.0,drive=usbstick
 
 #-audiodev pa,id=snd0,server=/mnt/wslg/PulseServer,out.latency=50000,out.buffer-length=100000 \
 
@@ -284,6 +293,7 @@ clean:
 	@rm -rf *.bin *.dis *.o os-image.bin *.elf *.swp
 	@rm -f *.vd $(MAP_OUTPUT)
 	@rm -rf kernel/*.o boot/*.bin drivers/*.o boot/*.o cpu/*.o libc/*.o */*.o
+	@rm -f $(KERNEL_FS_DIR)/kernel*.bin $(KERNEL_FS_DIR)/boot.cfg $(KERNEL_FS_DIR)/default $(KERNEL_FS_DIR)/active $(KERNEL_FS_DIR)/versions.txt
 	@-rm -rf image
 
 clear:
