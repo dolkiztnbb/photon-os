@@ -409,20 +409,24 @@ void base_to_string(long value, int base, int uppercase, int width, char *out_bu
     char buffer[64];
     int i = 0;
     int is_negative = 0;
+    // Считаем в беззнаковом виде: иначе числа >= 0x80000000 (адреса MMIO и т.п.)
+    // в %x/%X/%o/%b оказывались «отрицательными» и печатались пустой строкой.
+    unsigned long uvalue = (unsigned long)value;
 
     // Обработка отрицательных чисел для десятичной системы
     if (value < 0 && base == 10) {
         is_negative = 1;
-        value = -value;
-    } else if (value == 0) {
+        uvalue = 0UL - uvalue;
+    }
+    if (uvalue == 0) {
         buffer[i++] = '0';
     }
 
     // Основной цикл конвертации
     const char *digits = uppercase ? "0123456789ABCDEF" : "0123456789abcdef";
-    while (value > 0) {
-        buffer[i++] = digits[value % base];
-        value /= base;
+    while (uvalue > 0) {
+        buffer[i++] = digits[uvalue % base];
+        uvalue /= base;
     }
 
     // Добавляем нули для соблюдения ширины (учитываем знак минуса)

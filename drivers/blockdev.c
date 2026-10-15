@@ -7,8 +7,10 @@
  *                              если его нет — ATAPI-привод, на котором лежит образ;
  *      - загрузка с HDD/USB -> устройство, у которого сектор image_lba совпадает
  *                              с MBR, который прочитал BIOS (так мы находим «свой»
- *                              диск среди SATA/IDE), иначе — ramdisk rd0 (так
- *                              работает USB-флешка: USB-стека в ядре нет).
+ *                              диск среди SATA/IDE). Если такого нет, нас, скорее
+ *                              всего, загрузили с флешки: только тогда ищем её
+ *                              через USB (drivers/usb.c, EHCI). Не нашли (хаб, xHCI,
+ *                              USB 1.1) — ramdisk rd0, копия образа в ОЗУ.
  *   2. Без bootinfo (старый загрузчик / отладка) — первый найденный диск,
  *      образ считается лежащим с нулевого сектора.
  */
@@ -16,6 +18,7 @@
 #include <drivers/ahci.h>
 #include <drivers/ata.h>
 #include <drivers/ramdisk.h>
+#include <drivers/usb.h>
 #include <drivers/pci.h>
 #include <kernel/debug.h>
 #include <libc/mem.h>
@@ -120,6 +123,12 @@ static int device_has_image(blockdev_t* dev, uint32_t base) {
     return sector[510] == 0x55 && sector[511] == 0xAA;
 }
 
+/* Для usb_init(): лежит ли на найденной флешке наш образ? */
+static uint32_t usb_probe_base = 0;
+static int usb_is_boot_disk(blockdev_t* dev) {
+    return device_has_image(dev, usb_probe_base);
+}
+
 static blockdev_t* find_image_device(uint32_t base, int want_cd) {
     for (int i = 0; i < device_count; i++) {
         int is_cd = devices[i].sector_size == 2048;
@@ -144,7 +153,6 @@ int blockdev_init_boot(void) {
 
     ahci_probe();
     ata_init();
-    usb_init();
     if (bootinfo_valid) ramdisk_init_from_bootinfo(&bootinfo_copy);
 
     boot_dev = 0;
@@ -165,6 +173,15 @@ int blockdev_init_boot(void) {
             }
         } else {
             boot_dev = find_image_device(image_base, 0);
+            if (!boot_dev) {
+                /* На SATA/IDE образа нет — значит, нас загрузили с USB-флешки.
+                 * USB трогаем только сейчас: забирая контроллер у BIOS, ядро
+                 * выключает BIOS-эмуляцию USB-клавиатуры, поэтому без нужды
+                 * этого делать нельзя. Чужие флешки usb_init() не берёт. */
+                usb_probe_base = image_base;
+                if (usb_init(usb_is_boot_disk))
+                    boot_dev = blockdev_find("usb0");
+            }
             if (!boot_dev && rd) {
                 boot_dev = rd;
                 kprintw("boot: boot disk not accessible from kernel (USB?), using RAM copy\n");
@@ -179,6 +196,8 @@ int blockdev_init_boot(void) {
         for (int i = 0; i < device_count && !boot_dev; i++)
             if (devices[i].sector_size == 512 && !(devices[i].flags & BLK_FLAG_VOLATILE))
                 boot_dev = &devices[i];
+        if (!boot_dev && usb_init(0))
+            boot_dev = blockdev_find("usb0");
     }
 
     if (!boot_dev) {

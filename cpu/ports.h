@@ -13,6 +13,6 @@ void outl(uint16_t port, uint32_t val);
 uint32_t inl(uint16_t port);
 
 #define inb port_byte_in
-#define outb port_word_out
+#define outb port_byte_out
 
 #endif
