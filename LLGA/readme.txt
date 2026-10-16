@@ -1,1 +1,0 @@
-LLGA - Low Level Graphics API, used by kernel

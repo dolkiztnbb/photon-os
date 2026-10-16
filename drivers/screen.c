@@ -8,6 +8,14 @@
 #include <macros/macros.h>
 #include <stdarg.h>
 
+
+// MASSIVE TODO: REMOVE EVERY FONT THINGY
+// MASSIVE TODO: REMOVE EVERY FONT THINGY
+// MASSIVE TODO: REMOVE EVERY FONT THINGY
+// MASSIVE TODO: REMOVE EVERY FONT THINGY
+// MASSIVE TODO: REMOVE EVERY FONT THINGY
+
+
 int offsetx = 0, offsety = 0;
 int SCREEN_SCROLL = 1;
 char silent = 0;
