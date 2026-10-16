@@ -9,7 +9,7 @@
  *                      данные отдаются порциями по 1024 байта — проверяем,
  *                      что драйвер правильно обрабатывает несколько DRQ-фаз).
  * Плюс заглушки ядра: kprint*, PCI config space с одним IDE-контроллером
- * 00:01.1 (prog-if 80h = оба канала в legacy-режиме), AHCI отсутствует.
+ * 00:01.1 (prog-if 80h = оба канала в legacy-режиме), AHCI и USB отсутствуют.
  *
  * Этот файл не включает заголовки ядра — только хостовую libc.
  */
@@ -370,6 +370,11 @@ uint32_t pci_scan_bus(void) { return 0; }          /* AHCI нет */
 uint8_t initialize_ahci_and_read(uint32_t abar) { (void)abar; return 2; }
 uint8_t ahci_read_sector(uint32_t lba, char* buffer) { (void)lba; (void)buffer; return 1; }
 uint8_t ahci_write_sector(uint32_t lba, const char* buffer) { (void)lba; (void)buffer; return 1; }
+
+/* --- drivers/usb.h -------------------------------------------------------------------- */
+/* USB-контроллеров в модели нет: usb_init() ничего не находит, как на машине без EHCI
+ * (или с флешкой на xHCI) — blockdev.c должен выбрать rd0. */
+int usb_init(int (*accept)(void* dev)) { (void)accept; return 0; }
 
 /* --- kernel/debug.h ------------------------------------------------------------------- */
 

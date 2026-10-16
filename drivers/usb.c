@@ -1,23 +1,31 @@
 /*
- * drivers/usb.c — 32-битный драйвер USB 2.0 EHCI + USB Mass Storage (BOT / SCSI)
+ * drivers/usb.c — 32-битный драйвер USB 2.0: EHCI + USB-хабы + USB Mass Storage (BOT / SCSI)
  * Работает полностью в защищённом режиме через DMA и MMIO, без прерываний (опрос).
  *
  * Что умеет:
  *   - перебирает ВСЕ EHCI-контроллеры на PCI (класс 0C/03/20);
  *   - забирает контроллер у BIOS по правилам EHCI (USBLEGSUP handoff);
- *   - High-Speed флешка, воткнутая прямо в корневой порт контроллера;
- *     Full/Low-Speed устройства (клавиатуры, мыши, флешки USB 1.1) отдаются
- *     companion-контроллеру UHCI/OHCI, как это делает BIOS;
+ *   - USB-хабы: USB 2.0 (High-Speed) и USB 1.1 (Full-Speed), цепочки до 5
+ *     хабов. В том числе встроенный «rate matching hub» (RMH) чипсетов Intel
+ *     5-9 серий: там к корневому порту EHCI подключён только он, а все
+ *     разъёмы платы — к нему;
+ *   - High-Speed флешки на любом порту (корневом или хаба) и Full-Speed
+ *     (USB 1.1) флешки за High-Speed хабом — через его transaction translator
+ *     (split-транзакции, EHCI 4.12, их делает сам контроллер);
+ *   - Full/Low-Speed устройства прямо в корневом порту отдаются companion-
+ *     контроллеру UHCI/OHCI, как это делает BIOS; Low-Speed устройства за
+ *     хабами (клавиатуры, мыши) драйвер не трогает вовсе;
  *   - если на контроллере не нашлось нужной флешки, он сбрасывается и
  *     возвращается BIOS (чтобы не ломать BIOS-эмуляцию USB-клавиатуры).
  *
- * Чего (пока) нет: USB-хабов (в т.ч. встроенного «rate matching hub» в
- * чипсетах Intel 5-й серии и новее — там все порты EHCI идут через него)
- * и xHCI (USB 3.x). В этих случаях флешка ядру не видна, и оно работает с
- * копией образа в ОЗУ (rd0), которую сделал загрузчик.
+ * Чего (пока) нет: xHCI (USB 3.x). На платах, где порты обслуживает только
+ * xHCI (Intel 100-й серии и новее, AMD Ryzen, Intel 7-9 серий в режиме xHCI),
+ * флешка ядру не видна, и оно работает с копией образа в ОЗУ (rd0), которую
+ * сделал загрузчик. Драйвера HID тоже нет: USB-клавиатура на том же
+ * EHCI-контроллере, что и флешка, после захвата контроллера перестаёт работать.
  *
- * ВСЕ ожидания ограничены по времени: если контроллер или флешка ведут себя
- * не так, как ожидается, драйвер сдаётся, и загрузка продолжается.
+ * ВСЕ ожидания ограничены по времени: если контроллер или устройство ведут
+ * себя не так, как ожидается, драйвер сдаётся, и загрузка продолжается.
  */
 
 #include <drivers/usb.h>
@@ -33,7 +41,9 @@ extern uint32_t page_directory[1024];
 extern void vmm_identity_map_page(uint32_t* pd, uintptr_t phys_addr, uint32_t flags);
 
 /* ---- стандартные запросы USB --------------------------------------------- */
+#define USB_REQ_GET_STATUS      0x00
 #define USB_REQ_CLEAR_FEATURE   0x01
+#define USB_REQ_SET_FEATURE     0x03
 #define USB_REQ_SET_ADDRESS     0x05
 #define USB_REQ_GET_DESCRIPTOR  0x06
 #define USB_REQ_SET_CONFIG      0x09
@@ -43,10 +53,48 @@ extern void vmm_identity_map_page(uint32_t* pd, uintptr_t phys_addr, uint32_t fl
 #define USB_DESC_CONFIG         0x02
 #define USB_DESC_INTERFACE      0x04
 #define USB_DESC_ENDPOINT       0x05
+#define USB_DESC_HUB            0x29
 
 #define USB_CLASS_MASS_STORAGE  0x08
 #define USB_CLASS_HUB           0x09
 #define USB_PROTO_BOT           0x50
+
+/* bmRequestType */
+#define RT_STD_IN               0x80   /* стандартный, к устройству, IN */
+#define RT_STD_OUT              0x00
+#define RT_STD_EP_OUT           0x02   /* стандартный, к endpoint'у */
+#define RT_CLASS_IFACE_OUT      0x21
+#define RT_HUB_IN               0xA0   /* класс hub, к самому хабу */
+#define RT_PORT_IN              0xA3   /* класс hub, к порту хаба */
+#define RT_PORT_OUT             0x23
+
+/* Скорости — в кодировке поля EPS у QH (EHCI 3.6.2) */
+#define USB_SPEED_FULL          0
+#define USB_SPEED_LOW           1
+#define USB_SPEED_HIGH          2
+
+/* ---- хабы (USB 2.0, глава 11.24) ------------------------------------------ */
+#define HUB_FEAT_PORT_ENABLE    1
+#define HUB_FEAT_PORT_RESET     4
+#define HUB_FEAT_PORT_POWER     8
+#define HUB_FEAT_C_CONNECTION   16     /* C_PORT_*: 16 + номер бита в wPortChange */
+
+/* wPortStatus */
+#define HPS_CONNECTION          (1u << 0)
+#define HPS_ENABLE              (1u << 1)
+#define HPS_OVERCURRENT         (1u << 3)
+#define HPS_RESET               (1u << 4)
+#define HPS_LOW_SPEED           (1u << 9)
+#define HPS_HIGH_SPEED          (1u << 10)
+/* wPortChange: биты 0..4 = C_CONNECTION, C_ENABLE, C_SUSPEND, C_OVER_CURRENT, C_RESET */
+#define HPC_ALL                 0x1Fu
+
+#define USB_MAX_DEVICES         32     /* устройств на одном контроллере */
+#define USB_MAX_HUB_DEPTH       5      /* до 5 хабов между контроллером и устройством (USB 2.0, 4.1.1) */
+#define HUB_MAX_PORTS           15
+#define HUB_CONNECT_WINDOW_MS   1000   /* сколько ждать подключения устройств к пустым портам хаба */
+#define HUB_POLL_MS             50
+#define HUB_RESET_TIMEOUT_MS    500
 
 #define SCSI_TEST_UNIT_READY    0x00
 #define SCSI_REQUEST_SENSE      0x03
@@ -130,9 +178,12 @@ extern void vmm_identity_map_page(uint32_t* pd, uintptr_t phys_addr, uint32_t fl
 #define QTD_BYTES_LEFT(tok)     (((tok) >> 16) & 0x7FFF)
 #define QTD_TOGGLE              (1u << 31)
 
-#define QH_EPS_HIGH             (2u << 12)
+#define QH_EPS(speed)           ((uint32_t)(speed) << 12)
 #define QH_DTC                  (1u << 14)  /* toggle берётся из qTD (нужно для control) */
 #define QH_HEAD                 (1u << 15)  /* H: голова async-списка (Head of Reclamation List) */
+#define QH_CTRL_EP              (1u << 27)  /* C: control endpoint Full/Low-Speed устройства */
+#define QH_HUB_ADDR(a)          ((uint32_t)((a) & 0x7F) << 16)  /* хаб с transaction translator */
+#define QH_HUB_PORT(p)          ((uint32_t)((p) & 0x7F) << 23)  /* ... и его порт */
 #define QH_MULT_1               (1u << 30)
 
 /* qTD (EHCI 3.5). У контроллеров с 64-битной адресацией (HCCPARAMS бит 0 —
@@ -225,14 +276,35 @@ typedef struct {
 static ehci_ctrl_t hc;
 static int hc_dead = 0;          /* контроллер не отвечает — все передачи сразу с ошибкой */
 
-static uint8_t  next_dev_addr = 1;
-static uint8_t  usb_dev_addr = 0;
-static uint8_t  usb_mps0 = 64;
+/* Устройство на шине. Для Full/Low-Speed устройств за High-Speed хабом
+ * контроллер сам делает split-транзакции через transaction translator (TT)
+ * этого хаба — ему нужно знать адрес хаба и номер порта (EHCI 4.12). */
+typedef struct usb_dev {
+    struct usb_dev* parent;      /* хаб, в который включено устройство; 0 — корневой порт */
+    uint8_t  port;               /* номер порта: корневого (с 0) или хаба (с 1) */
+    uint8_t  depth;              /* сколько хабов между контроллером и устройством */
+    uint8_t  speed;              /* USB_SPEED_* */
+    uint8_t  addr;               /* адрес на шине; 0 — ещё не назначен */
+    uint8_t  mps0;               /* максимальный размер пакета EP0 */
+    uint8_t  tt_hub;             /* Full/Low-Speed: адрес High-Speed хаба с TT */
+    uint8_t  tt_port;            /*                 и порт этого хаба */
+} usb_dev_t;
+
+static usb_dev_t usb_devs[USB_MAX_DEVICES];
+static int       usb_ndevs = 0;
+static uint8_t   next_dev_addr = 1;
+
+/* дескрипторы последнего опрошенного устройства */
+static uint8_t   dev_desc[18];
+static uint8_t   cfg_desc[512];
+static uint16_t  cfg_len = 0;
+
+static usb_dev_t* msc_dev = 0;   /* флешка, с которой работает usb0 */
 static uint8_t  usb_iface = 0;
 static uint8_t  ep_in = 0, ep_out = 0;
 static uint16_t ep_in_mps = 512, ep_out_mps = 512;
 static uint32_t usb_total_sectors = 0;
-static char     usb_model[41] = "USB 2.0 Flash Drive";
+static char     usb_model[41] = "USB Flash Drive";
 static uint32_t bot_tag_counter = 0x1000;
 static int      usb_ready = 0;   /* usb0 зарегистрирован и работает */
 static int      usb_failures = 0;/* подряд неудачных обращений к usb0 */
@@ -344,10 +416,32 @@ static int ehci_run(ehci_qh_t* qh, ehci_qtd_t* first, ehci_qtd_t* last, uint32_t
 }
 
 /* -------------------------------------------------------------------------- */
+/* QH для endpoint'а устройства                                               */
+/* -------------------------------------------------------------------------- */
+static void qh_setup(ehci_qh_t* qh, const usb_dev_t* d, uint8_t ep, uint16_t mps, int control) {
+    memset((void*)qh, 0, sizeof(ehci_qh_t));
+    qh->qhlp = ((uint32_t)qh) | LINK_TYPE_QH;
+    /* H = 1: каждый QH стоит в async-списке один (ссылается сам на себя), и
+     * без головы списка QEMU вообще не обрабатывает очередь. */
+    qh->ep_char = (d->addr & 0x7F) | ((uint32_t)(ep & 0x0F) << 8) | QH_EPS(d->speed) | QH_HEAD |
+                  ((uint32_t)(mps & 0x7FF) << 16);
+    if (control) {
+        qh->ep_char |= QH_DTC;                   /* toggle берётся из qTD */
+        if (d->speed != USB_SPEED_HIGH) qh->ep_char |= QH_CTRL_EP;
+    }
+    qh->ep_cap = QH_MULT_1;
+    if (d->speed != USB_SPEED_HIGH)              /* split-транзакции через TT хаба */
+        qh->ep_cap |= QH_HUB_ADDR(d->tt_hub) | QH_HUB_PORT(d->tt_port);
+    qh->next_qtd = LINK_TERMINATE;
+    qh->alt_next_qtd = LINK_TERMINATE;
+}
+
+/* -------------------------------------------------------------------------- */
 /* Control Transfer (Endpoint 0)                                              */
 /* -------------------------------------------------------------------------- */
-static int usb_control_msg(uint8_t dev, uint8_t req_type, uint8_t req, uint16_t val,
-                           uint16_t idx, uint16_t len, void* data) {
+static int usb_control_xfer(usb_dev_t* d, uint8_t req_type, uint8_t req, uint16_t val,
+                            uint16_t idx, uint16_t len, void* data, uint16_t* actual) {
+    if (actual) *actual = 0;
     if (len > sizeof(dma_buffer)) return XFER_ERROR;
     int is_in = (req_type & 0x80) != 0;
 
@@ -361,10 +455,7 @@ static int usb_control_msg(uint8_t dev, uint8_t req_type, uint8_t req, uint16_t 
     setup_pkt[7] = (len >> 8) & 0xFF;
 
     ehci_qh_t* qh = &qh_pool[QH_CONTROL];
-    memset((void*)qh, 0, sizeof(ehci_qh_t));
-    qh->qhlp = ((uint32_t)qh) | LINK_TYPE_QH;
-    qh->ep_char = (dev & 0x7F) | QH_EPS_HIGH | QH_DTC | QH_HEAD | ((uint32_t)usb_mps0 << 16);
-    qh->ep_cap = QH_MULT_1;
+    qh_setup(qh, d, 0, d->mps0, 1);
 
     ehci_qtd_t* qtd_setup = &qtd_pool[0];
     ehci_qtd_t* qtd_data  = &qtd_pool[1];
@@ -378,6 +469,8 @@ static int usb_control_msg(uint8_t dev, uint8_t req_type, uint8_t req, uint16_t 
 
     if (len > 0) {
         if (data && !is_in) memcpy(dma_buffer, data, len);
+        /* короткий пакет в стадии данных: alt_next = T, контроллер сразу
+         * переходит к статус-стадии (EHCI 4.10.2) */
         qtd_data->next_qtd = (uint32_t)qtd_stat;
         qtd_data->alt_next_qtd = LINK_TERMINATE;
         qtd_data->token = QTD_ACTIVE | (is_in ? QTD_PID_IN : QTD_PID_OUT) | QTD_CERR_3 |
@@ -392,10 +485,18 @@ static int usb_control_msg(uint8_t dev, uint8_t req_type, uint8_t req, uint16_t 
                       QTD_CERR_3 | QTD_TOGGLE | QTD_IOC;
 
     int res = ehci_run(qh, qtd_setup, qtd_stat, CTRL_TIMEOUT_MS);
-    if (res == XFER_OK && len > 0 && is_in && data) {
-        memcpy(data, dma_buffer, len);
+    if (res == XFER_OK && len > 0) {
+        uint32_t got = len - QTD_BYTES_LEFT(qtd_data->token);
+        if (got > len) got = len;
+        if (is_in && data) memcpy(data, dma_buffer, got);
+        if (actual) *actual = (uint16_t)got;
     }
     return res;
+}
+
+static int usb_control_msg(usb_dev_t* d, uint8_t req_type, uint8_t req, uint16_t val,
+                           uint16_t idx, uint16_t len, void* data) {
+    return usb_control_xfer(d, req_type, req, val, idx, len, data, 0);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -424,27 +525,19 @@ static int usb_bulk_transfer(int is_in, void* data, uint32_t len, uint32_t* actu
 }
 
 static void bulk_qh_init(ehci_qh_t* qh, uint8_t ep, uint16_t mps) {
-    memset((void*)qh, 0, sizeof(ehci_qh_t));
-    qh->qhlp = ((uint32_t)qh) | LINK_TYPE_QH;
-    /* H = 1: каждый QH стоит в async-списке один (ссылается сам на себя), и
-     * без головы списка QEMU вообще не обрабатывает очередь. */
-    qh->ep_char = (usb_dev_addr & 0x7F) | ((uint32_t)(ep & 0x0F) << 8) | QH_EPS_HIGH | QH_HEAD |
-                  ((uint32_t)mps << 16);
-    qh->ep_cap = QH_MULT_1;
-    qh->next_qtd = LINK_TERMINATE;
-    qh->alt_next_qtd = LINK_TERMINATE;
+    qh_setup(qh, msc_dev, ep, mps, 0);           /* DTC = 0: toggle ведёт контроллер */
 }
 
 /* CLEAR_FEATURE(ENDPOINT_HALT): снимает STALL, toggle на обеих сторонах -> DATA0 */
 static void usb_clear_halt(int is_in) {
     uint8_t ep = is_in ? (uint8_t)(ep_in | 0x80) : ep_out;
-    usb_control_msg(usb_dev_addr, 0x02, USB_REQ_CLEAR_FEATURE, 0, ep, 0, 0);
+    usb_control_msg(msc_dev, RT_STD_EP_OUT, USB_REQ_CLEAR_FEATURE, 0, ep, 0, 0);
     qh_pool[is_in ? QH_BULK_IN : QH_BULK_OUT].token &= ~QTD_TOGGLE;
 }
 
 /* Reset Recovery из спецификации BOT 5.3.4 */
 static void bot_reset_recovery(void) {
-    usb_control_msg(usb_dev_addr, 0x21, USB_REQ_BOT_RESET, 0, usb_iface, 0, 0);
+    usb_control_msg(msc_dev, RT_CLASS_IFACE_OUT, USB_REQ_BOT_RESET, 0, usb_iface, 0, 0);
     mdelay(10);
     usb_clear_halt(1);
     usb_clear_halt(0);
@@ -580,7 +673,7 @@ static int usb_blk_write(blockdev_t* dev, uint32_t lba, const void* buf) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Инициализация накопителя на включённом (после сброса) порту                 */
+/* Устройства: адресация и дескрипторы                                         */
 /* -------------------------------------------------------------------------- */
 static void copy_trimmed(char* dst, const uint8_t* src, int n) {
     int len = n;
@@ -589,88 +682,124 @@ static void copy_trimmed(char* dst, const uint8_t* src, int n) {
     dst[len] = 0;
 }
 
-static int usb_init_mass_storage(uint32_t port) {
-    uint8_t buf[256];
-    usb_ready = 0;
-    usb_cache_count = 0;
-    usb_dev_addr = 0;
-    usb_mps0 = 64;                       /* для High-Speed размер пакета EP0 всегда 64 */
+static const char* speed_name(uint8_t speed) {
+    return speed == USB_SPEED_HIGH ? "high" : speed == USB_SPEED_LOW ? "low" : "full";
+}
+
+/* «Адрес» устройства для сообщений: корневой порт, затем порты хабов — 0.3.2 */
+static const char* usb_path(const usb_dev_t* d) {
+    static char buf[32];
+    uint8_t ports[USB_MAX_HUB_DEPTH + 2];
+    int n = 0;
+    for (; d && n < (int)sizeof(ports); d = d->parent) ports[n++] = d->port;
+    char* p = buf;
+    while (n--) {
+        uint8_t v = ports[n];
+        if (v >= 100) *p++ = '0' + v / 100;
+        if (v >= 10)  *p++ = '0' + (v / 10) % 10;
+        *p++ = '0' + v % 10;
+        if (n) *p++ = '.';
+    }
+    *p = 0;
+    return buf;
+}
+
+static usb_dev_t* usb_alloc_dev(usb_dev_t* parent, uint8_t port, uint8_t speed) {
+    if (usb_ndevs >= USB_MAX_DEVICES) {
+        kprintw("usb: too many devices on one controller, the rest are ignored\n");
+        return 0;
+    }
+    usb_dev_t* d = &usb_devs[usb_ndevs++];
+    memset(d, 0, sizeof(*d));
+    d->parent = parent;
+    d->port = port;
+    d->speed = speed;
+    d->depth = parent ? parent->depth + 1 : 0;
+    if (speed != USB_SPEED_HIGH && parent) {
+        if (parent->speed == USB_SPEED_HIGH) {   /* TT — в этом High-Speed хабе */
+            d->tt_hub = parent->addr;
+            d->tt_port = port;
+        } else {                                 /* Full-Speed хаб сам за TT */
+            d->tt_hub = parent->tt_hub;
+            d->tt_port = parent->tt_port;
+        }
+    }
+    return d;
+}
+
+/* Назначает адрес только что сброшенному устройству (оно отвечает по адресу 0)
+ * и читает его дескрипторы в dev_desc / cfg_desc. 0 — успех. */
+static int usb_enumerate(usb_dev_t* d) {
+    d->addr = 0;
+    d->mps0 = (d->speed == USB_SPEED_HIGH) ? 64 : 8;
 
     /* 1. Первые 8 байт дескриптора устройства по адресу 0 (как это делает
      *    Windows: некоторые флешки иначе не принимают SET_ADDRESS). */
-    memset(buf, 0, sizeof(buf));
-    if (usb_control_msg(0, 0x80, USB_REQ_GET_DESCRIPTOR, (USB_DESC_DEVICE << 8), 0, 8, buf) != XFER_OK) {
-        kprintd("usb: port %d: device does not answer\n", port);
-        return -1;
+    memset(dev_desc, 0, sizeof(dev_desc));
+    int r = XFER_ERROR;
+    for (int attempt = 0; attempt < 3 && !hc_dead; attempt++) {
+        r = usb_control_msg(d, RT_STD_IN, USB_REQ_GET_DESCRIPTOR, USB_DESC_DEVICE << 8, 0, 8, dev_desc);
+        if (r == XFER_OK) break;
+        mdelay(20);
     }
-    if (buf[7] == 8 || buf[7] == 16 || buf[7] == 32 || buf[7] == 64) usb_mps0 = buf[7];
+    if (r != XFER_OK) return -1;
+    uint8_t mps = dev_desc[7];
+    if (d->speed == USB_SPEED_FULL && (mps == 8 || mps == 16 || mps == 32 || mps == 64))
+        d->mps0 = mps;                           /* High-Speed — всегда 64, Low-Speed — 8 */
 
+    if (next_dev_addr > 127) return -1;
     uint8_t addr = next_dev_addr++;
-    if (next_dev_addr > 127) next_dev_addr = 1;
-    if (usb_control_msg(0, 0x00, USB_REQ_SET_ADDRESS, addr, 0, 0, 0) != XFER_OK) return -1;
-    mdelay(10);                          /* SET_ADDRESS recovery: >= 2 мс */
-    usb_dev_addr = addr;
+    if (usb_control_msg(d, RT_STD_OUT, USB_REQ_SET_ADDRESS, addr, 0, 0, 0) != XFER_OK) return -1;
+    mdelay(10);                                  /* SET_ADDRESS recovery: >= 2 мс */
+    d->addr = addr;
 
-    if (usb_control_msg(usb_dev_addr, 0x80, USB_REQ_GET_DESCRIPTOR, (USB_DESC_DEVICE << 8), 0, 18, buf) != XFER_OK)
+    if (usb_control_msg(d, RT_STD_IN, USB_REQ_GET_DESCRIPTOR, USB_DESC_DEVICE << 8, 0, 18, dev_desc) != XFER_OK)
         return -1;
-    uint8_t dev_class = buf[4];
-    if (dev_class == USB_CLASS_HUB) {
-        kprintw("usb: port %d: USB hub found - hubs are not supported yet\n", port);
-        return -1;
-    }
 
     /* 2. Конфигурация: сначала 9 байт ради wTotalLength, потом целиком. */
-    if (usb_control_msg(usb_dev_addr, 0x80, USB_REQ_GET_DESCRIPTOR, (USB_DESC_CONFIG << 8), 0, 9, buf) != XFER_OK)
+    cfg_len = 0;
+    memset(cfg_desc, 0, sizeof(cfg_desc));
+    if (usb_control_msg(d, RT_STD_IN, USB_REQ_GET_DESCRIPTOR, USB_DESC_CONFIG << 8, 0, 9, cfg_desc) != XFER_OK)
         return -1;
-    uint16_t total_len = buf[2] | (buf[3] << 8);
-    uint8_t config_value = buf[5];
-    if (total_len < 9) return -1;
-    if (total_len > sizeof(buf)) total_len = sizeof(buf);
-    if (usb_control_msg(usb_dev_addr, 0x80, USB_REQ_GET_DESCRIPTOR, (USB_DESC_CONFIG << 8), 0, total_len, buf) != XFER_OK)
+    uint16_t total = cfg_desc[2] | (cfg_desc[3] << 8);
+    if (total < 9) return -1;
+    if (total > sizeof(cfg_desc)) total = sizeof(cfg_desc);
+    uint16_t got = 0;
+    if (usb_control_xfer(d, RT_STD_IN, USB_REQ_GET_DESCRIPTOR, USB_DESC_CONFIG << 8, 0, total, cfg_desc, &got) != XFER_OK)
         return -1;
+    cfg_len = got < total ? got : total;
+    return 0;
+}
 
-    /* 3. Ищем интерфейс Mass Storage / Bulk-Only (alt setting 0) и его bulk-endpoint'ы */
-    ep_in = 0; ep_out = 0;
-    int in_msc = 0, iface_found = 0;
-    uint16_t offset = 0;
-    while (offset + 2 <= total_len) {
-        uint8_t len  = buf[offset];
-        uint8_t type = buf[offset + 1];
-        if (len < 2 || offset + len > total_len) break;
-        if (type == USB_DESC_INTERFACE && len >= 9) {
-            if (iface_found) break;      /* следующий интерфейс — endpoint'ы уже собраны */
-            in_msc = buf[offset + 3] == 0 && buf[offset + 5] == USB_CLASS_MASS_STORAGE &&
-                     buf[offset + 7] == USB_PROTO_BOT;
-            if (in_msc) {
-                usb_iface = buf[offset + 2];
-                iface_found = 1;
-            }
-        } else if (type == USB_DESC_ENDPOINT && len >= 7 && in_msc) {
-            uint8_t ep_addr = buf[offset + 2];
-            uint8_t ep_attr = buf[offset + 3];
-            uint16_t mps = (buf[offset + 4] | (buf[offset + 5] << 8)) & 0x7FF;
-            if ((ep_attr & 0x03) == 0x02) {
-                if (ep_addr & 0x80) { ep_in  = ep_addr & 0x0F; ep_in_mps  = mps ? mps : 512; }
-                else                { ep_out = ep_addr & 0x0F; ep_out_mps = mps ? mps : 512; }
-            }
-        }
-        offset += len;
-    }
-    if (!iface_found || !ep_in || !ep_out) {
-        kprintd("usb: port %d: not a USB mass storage (BOT) device, class %x\n", port, dev_class);
-        return -1;
-    }
+/* -------------------------------------------------------------------------- */
+/* USB Mass Storage                                                           */
+/* -------------------------------------------------------------------------- */
+/* Запускает флешку и, если accept согласен, регистрирует её как usb0.
+ * 1 — usb0 зарегистрирован. */
+static int usb_msc_probe(usb_dev_t* d, uint8_t config, uint8_t iface,
+                         uint8_t in, uint16_t in_mps, uint8_t out, uint16_t out_mps,
+                         int (*accept)(blockdev_t*)) {
+    usb_ready = 0;
+    usb_cache_count = 0;
+    msc_dev = d;
+    usb_iface = iface;
+    ep_in = in;
+    ep_out = out;
+    uint16_t def_mps = (d->speed == USB_SPEED_HIGH) ? 512 : 64;
+    ep_in_mps = in_mps ? in_mps : def_mps;
+    ep_out_mps = out_mps ? out_mps : def_mps;
+    memcpy(usb_model, "USB Flash Drive", sizeof("USB Flash Drive"));
 
-    if (usb_control_msg(usb_dev_addr, 0x00, USB_REQ_SET_CONFIG, config_value, 0, 0, 0) != XFER_OK)
-        return -1;
+    if (usb_control_msg(d, RT_STD_OUT, USB_REQ_SET_CONFIG, config, 0, 0, 0) != XFER_OK)
+        return 0;
     mdelay(10);
 
     /* После SET_CONFIGURATION toggle у bulk-endpoint'ов = DATA0 */
     bulk_qh_init(&qh_pool[QH_BULK_OUT], ep_out, ep_out_mps);
     bulk_qh_init(&qh_pool[QH_BULK_IN],  ep_in,  ep_in_mps);
 
-    /* 4. Ждём готовности носителя (после включения флешка отвечает
-     *    «UNIT ATTENTION», пока у неё не спросят sense-данные). */
+    /* Ждём готовности носителя (после включения флешка отвечает
+     * «UNIT ATTENTION», пока у неё не спросят sense-данные). */
     uint8_t tur[6] = { SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0 };
     int ready = 0;
     for (int i = 0; i < 20 && !hc_dead; i++) {
@@ -679,16 +808,16 @@ static int usb_init_mass_storage(uint32_t port) {
         if (r == 1) usb_request_sense();
         mdelay(100);
     }
-    if (hc_dead) return -1;
-    if (!ready) kprintw("usb: port %d: medium is not ready, trying anyway\n", port);
+    if (hc_dead) return 0;
+    if (!ready) kprintw("usb: port %s: medium is not ready, trying anyway\n", usb_path(d));
 
     uint8_t inq[6] = { SCSI_INQUIRY, 0, 0, 0, 36, 0 };
     uint8_t inq_resp[36];
     memset(inq_resp, 0, sizeof(inq_resp));
     if (usb_bot_scsi(inq, 6, inq_resp, 36, 1) == 0) {
         if ((inq_resp[0] & 0x1F) != 0x00) {
-            kprintd("usb: port %d: SCSI device type %x is not a disk\n", port, inq_resp[0] & 0x1F);
-            return -1;
+            kprintd("usb: port %s: SCSI device type %x is not a disk\n", usb_path(d), inq_resp[0] & 0x1F);
+            return 0;
         }
         char vid[9], pid[17], model[41];
         copy_trimmed(vid, &inq_resp[8], 8);
@@ -705,23 +834,251 @@ static int usb_init_mass_storage(uint32_t port) {
     uint8_t rc_resp[8];
     memset(rc_resp, 0, sizeof(rc_resp));
     int r = usb_bot_scsi(rc_cmd, 10, rc_resp, 8, 1);
-    if (r == 1) {                        /* часто проходит со второй попытки */
+    if (r == 1) {                                /* часто проходит со второй попытки */
         usb_request_sense();
         r = usb_bot_scsi(rc_cmd, 10, rc_resp, 8, 1);
     }
     if (r != 0) {
-        kprintw("usb: port %d: READ CAPACITY failed\n", port);
-        return -1;
+        kprintw("usb: port %s: READ CAPACITY failed\n", usb_path(d));
+        return 0;
     }
     uint32_t last_lba = ((uint32_t)rc_resp[0] << 24) | (rc_resp[1] << 16) | (rc_resp[2] << 8) | rc_resp[3];
     uint32_t blk_size = ((uint32_t)rc_resp[4] << 24) | (rc_resp[5] << 16) | (rc_resp[6] << 8) | rc_resp[7];
     if (blk_size != 512) {
-        kprintw("usb: port %d: %d-byte sectors are not supported\n", port, blk_size);
-        return -1;
+        kprintw("usb: port %s: %d-byte sectors are not supported\n", usb_path(d), blk_size);
+        return 0;
     }
     usb_total_sectors = last_lba + 1;
     usb_failures = 0;
     usb_ready = 1;
+
+    blockdev_t bd;
+    memset(&bd, 0, sizeof(bd));
+    strncpy(bd.name, "usb0", BLK_NAME_LEN - 1);
+    strncpy(bd.model, usb_model, sizeof(bd.model) - 1);
+    bd.sector_size = 512;
+    bd.total_sectors = usb_total_sectors;
+    bd.flags = BLK_FLAG_REMOVABLE;
+    bd.read = usb_blk_read;
+    bd.write = usb_blk_write;
+
+    if (accept && !accept(&bd)) {
+        kprintd("usb: port %s: %s is not the boot disk, skipped\n", usb_path(d), usb_model);
+        usb_ready = 0;
+        return 0;
+    }
+
+    blockdev_register(&bd);
+    kprinti("usb: mounted %s (%s), %d MB\n", bd.name, bd.model, bd.total_sectors / 2048);
+    return 1;
+}
+
+/* -------------------------------------------------------------------------- */
+/* USB-хабы (USB 2.0, глава 11)                                               */
+/* -------------------------------------------------------------------------- */
+static int usb_attach(usb_dev_t* d, int (*accept)(blockdev_t*));
+
+static int hub_port_feature(usb_dev_t* hub, uint8_t port, int set, uint16_t feature) {
+    return usb_control_msg(hub, RT_PORT_OUT, set ? USB_REQ_SET_FEATURE : USB_REQ_CLEAR_FEATURE,
+                           feature, port, 0, 0);
+}
+
+static int hub_port_status(usb_dev_t* hub, uint8_t port, uint16_t* status, uint16_t* change) {
+    uint8_t b[4] = { 0, 0, 0, 0 };
+    uint16_t got = 0;
+    if (usb_control_xfer(hub, RT_PORT_IN, USB_REQ_GET_STATUS, 0, port, 4, b, &got) != XFER_OK || got < 4)
+        return -1;
+    *status = b[0] | (b[1] << 8);
+    *change = b[2] | (b[3] << 8);
+    return 0;
+}
+
+/* Сбросить биты изменений порта (C_PORT_CONNECTION ... C_PORT_RESET) */
+static void hub_clear_changes(usb_dev_t* hub, uint8_t port, uint16_t change) {
+    for (int bit = 0; bit < 5; bit++)
+        if (change & (1u << bit)) hub_port_feature(hub, port, 0, HUB_FEAT_C_CONNECTION + bit);
+}
+
+/* Сброс порта хаба. 0 — порт включён, в *speed скорость устройства. */
+static int hub_port_reset(usb_dev_t* hub, uint8_t port, uint8_t* speed) {
+    for (int attempt = 0; attempt < 3 && !hc_dead; attempt++) {
+        if (hub_port_feature(hub, port, 1, HUB_FEAT_PORT_RESET) != XFER_OK) return -1;
+        uint16_t st = 0, ch = 0;
+        int done = 0;
+        /* хаб держит reset 10..20 мс, для High-Speed ещё и chirp (USB 2.0 7.1.7.5) */
+        for (uint32_t ms = 0; ms < HUB_RESET_TIMEOUT_MS; ms += 10) {
+            mdelay(10);
+            if (hub_port_status(hub, port, &st, &ch) != 0) return -1;
+            if (!(st & HPS_RESET)) { done = 1; break; }
+        }
+        hub_clear_changes(hub, port, ch & HPC_ALL);
+        if (!(st & HPS_CONNECTION)) return -1;  /* устройство отключили */
+        if (done && (st & HPS_ENABLE)) {
+            *speed = (st & HPS_LOW_SPEED) ? USB_SPEED_LOW :
+                     (st & HPS_HIGH_SPEED) ? USB_SPEED_HIGH : USB_SPEED_FULL;
+            mdelay(10);                          /* TRSTRCY */
+            return 0;
+        }
+        mdelay(50);
+    }
+    return -1;
+}
+
+/* Устройство подключено к порту хаба: сброс, адрес, опознание. 1 — usb0 найден. */
+static int hub_port_probe(usb_dev_t* hub, uint8_t port, int (*accept)(blockdev_t*)) {
+    for (int attempt = 0; attempt < 2 && !hc_dead; attempt++) {
+        uint8_t speed = USB_SPEED_FULL;
+        if (hub_port_reset(hub, port, &speed) != 0) {
+            kprintd("usb: port %s.%d: port reset failed\n", usb_path(hub), port);
+            break;
+        }
+        if (speed == USB_SPEED_LOW) {            /* клавиатура/мышь: флешкой быть не может */
+            kprintd("usb: port %s.%d: low-speed device, skipped\n", usb_path(hub), port);
+            break;
+        }
+        usb_dev_t* d = usb_alloc_dev(hub, port, speed);
+        if (!d) break;
+        if (usb_enumerate(d) == 0) {
+            if (usb_attach(d, accept)) return 1;
+            break;
+        }
+        /* бывает, что устройство не отвечает с первого раза — ещё один сброс */
+        kprintd("usb: port %s: %s-speed device does not answer\n", usb_path(d), speed_name(speed));
+    }
+    /* не наше устройство — выключаем порт, чтобы оно не мешало (в т.ч. если
+     * так и осталось на адресе 0) */
+    hub_port_feature(hub, port, 0, HUB_FEAT_PORT_ENABLE);
+    return 0;
+}
+
+/* Обход портов хаба. Устройства, которые уже были подключены, видны сразу;
+ * к пустым портам ещё HUB_CONNECT_WINDOW_MS ждём медленные устройства
+ * (после сброса хаба флешке нужно время, чтобы снова подключиться). */
+static int hub_scan_ports(usb_dev_t* hub, uint8_t nports, int (*accept)(blockdev_t*)) {
+    uint32_t pending = ((1u << nports) - 1) << 1;   /* биты 1..nports */
+    uint32_t waited = 0;
+    int errors = 0;
+    for (;;) {
+        int debounced = 0;
+        for (uint8_t p = 1; p <= nports && !hc_dead; p++) {
+            if (!(pending & (1u << p))) continue;
+            uint16_t st, ch;
+            if (hub_port_status(hub, p, &st, &ch) != 0) {
+                if (++errors >= 3) {
+                    kprintw("usb: hub at port %s does not respond, skipped\n", usb_path(hub));
+                    return 0;
+                }
+                continue;
+            }
+            errors = 0;
+            if (ch & HPC_ALL) hub_clear_changes(hub, p, ch & HPC_ALL);
+            if (!(st & HPS_CONNECTION)) continue;
+            pending &= ~(1u << p);
+            if (st & HPS_OVERCURRENT) {
+                kprintw("usb: port %s.%d: over-current, skipped\n", usb_path(hub), p);
+                continue;
+            }
+            if (st & HPS_LOW_SPEED) {            /* до сброса не трогаем вовсе */
+                kprintd("usb: port %s.%d: low-speed device, skipped\n", usb_path(hub), p);
+                continue;
+            }
+            if (!debounced) {                    /* TATTDB: подключение должно устояться */
+                mdelay(100);
+                debounced = 1;
+            }
+            if (hub_port_probe(hub, p, accept)) return 1;
+        }
+        if (!pending || hc_dead || waited >= HUB_CONNECT_WINDOW_MS) break;
+        mdelay(HUB_POLL_MS);
+        waited += HUB_POLL_MS;
+    }
+    return 0;
+}
+
+static int usb_hub_probe(usb_dev_t* hub, uint8_t config, int (*accept)(blockdev_t*)) {
+    if (hub->depth >= USB_MAX_HUB_DEPTH) {
+        kprintw("usb: port %s: too many hubs in a chain, skipped\n", usb_path(hub));
+        return 0;
+    }
+    if (usb_control_msg(hub, RT_STD_OUT, USB_REQ_SET_CONFIG, config, 0, 0, 0) != XFER_OK)
+        return 0;
+
+    uint8_t hd[16];
+    uint16_t got = 0;
+    memset(hd, 0, sizeof(hd));
+    if (usb_control_xfer(hub, RT_HUB_IN, USB_REQ_GET_DESCRIPTOR, USB_DESC_HUB << 8, 0,
+                         sizeof(hd), hd, &got) != XFER_OK || got < 7 || hd[1] != USB_DESC_HUB) {
+        kprintw("usb: port %s: cannot read hub descriptor\n", usb_path(hub));
+        return 0;
+    }
+    uint8_t nports = hd[2];
+    uint32_t pgood_ms = (uint32_t)hd[5] * 2;     /* bPwrOn2PwrGood, в 2-мс единицах */
+    if (nports == 0) return 0;
+    if (nports > HUB_MAX_PORTS) {
+        kprintw("usb: port %s: hub has %d ports, only %d are used\n", usb_path(hub), nports, HUB_MAX_PORTS);
+        nports = HUB_MAX_PORTS;
+    }
+    kprintd("usb: port %s: %d-port %s-speed hub\n", usb_path(hub), nports, speed_name(hub->speed));
+
+    /* Питание портов (хабы без управления питанием эту команду просто
+     * принимают) и ожидание его стабилизации: не меньше 100 мс. */
+    for (uint8_t p = 1; p <= nports; p++) hub_port_feature(hub, p, 1, HUB_FEAT_PORT_POWER);
+    mdelay(pgood_ms > 100 ? pgood_ms : 100);
+
+    return hub_scan_ports(hub, nports, accept);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Опознание устройства с уже назначенным адресом (после usb_enumerate):      */
+/* хаб — обходим его порты, флешка — пробуем как usb0.                         */
+/* 1 — usb0 найден и зарегистрирован                                           */
+/* -------------------------------------------------------------------------- */
+static int usb_attach(usb_dev_t* d, int (*accept)(blockdev_t*)) {
+    uint8_t  dev_class = dev_desc[4];
+    uint16_t vid = dev_desc[8] | (dev_desc[9] << 8);
+    uint16_t pid = dev_desc[10] | (dev_desc[11] << 8);
+    uint8_t  config = cfg_desc[5];
+
+    /* Интерфейс хаба или Mass Storage / Bulk-Only (alt setting 0) с парой
+     * bulk-endpoint'ов. cfg_desc нужно разобрать сейчас: его перезапишут
+     * устройства за хабом. */
+    int is_hub = (dev_class == USB_CLASS_HUB);
+    int msc = 0, in_msc = 0;
+    uint8_t iface = 0, in = 0, out = 0;
+    uint16_t in_mps = 0, out_mps = 0;
+    for (uint16_t off = 0; off + 2 <= cfg_len; ) {
+        uint8_t len  = cfg_desc[off];
+        uint8_t type = cfg_desc[off + 1];
+        if (len < 2 || off + len > cfg_len) break;
+        if (type == USB_DESC_INTERFACE && len >= 9) {
+            if (in_msc && in && out) msc = 1;
+            in_msc = 0;
+            if (cfg_desc[off + 3] == 0) {        /* alt setting 0 */
+                if (cfg_desc[off + 5] == USB_CLASS_HUB) is_hub = 1;
+                if (!msc && cfg_desc[off + 5] == USB_CLASS_MASS_STORAGE && cfg_desc[off + 7] == USB_PROTO_BOT) {
+                    in_msc = 1;
+                    iface = cfg_desc[off + 2];
+                    in = out = 0;
+                }
+            }
+        } else if (type == USB_DESC_ENDPOINT && len >= 7 && in_msc) {
+            uint8_t  ep_addr = cfg_desc[off + 2];
+            uint16_t mps = (cfg_desc[off + 4] | (cfg_desc[off + 5] << 8)) & 0x7FF;
+            if ((cfg_desc[off + 3] & 0x03) == 0x02) {    /* bulk */
+                if (ep_addr & 0x80) { in  = ep_addr & 0x0F; in_mps  = mps; }
+                else                { out = ep_addr & 0x0F; out_mps = mps; }
+            }
+        }
+        off += len;
+    }
+    if (in_msc && in && out) msc = 1;
+
+    if (is_hub) return usb_hub_probe(d, config, accept);
+    if (msc) {
+        kprintd("usb: port %s: %s-speed mass storage %4x:%4x\n", usb_path(d), speed_name(d->speed), vid, pid);
+        return usb_msc_probe(d, config, iface, in, in_mps, out, out_mps, accept);
+    }
+    kprintd("usb: port %s: %s-speed device %4x:%4x, skipped\n", usb_path(d), speed_name(d->speed), vid, pid);
     return 0;
 }
 
@@ -765,7 +1122,7 @@ static int ehci_reset_port(uint32_t p) {
     v = op_read(reg);
     if (!(v & PORT_CCS)) return 0;
     if (!(v & PORT_PE)) {                    /* Full-Speed устройство */
-        kprintd("usb: port %d: full-speed device, handing it to the companion controller\n", p);
+        kprintd("usb: port %d: full-speed device, handed to companion controller\n", p);
         ehci_release_port(p);
         return 0;
     }
@@ -913,35 +1270,24 @@ static int ehci_probe_controller(uint8_t bus, uint8_t dev, uint8_t fn, int (*acc
         return 0;
     }
 
+    usb_ndevs = 0;
+    next_dev_addr = 1;
     for (uint32_t p = 0; p < hc.n_ports && !hc_dead; p++) {
-        if (!ehci_reset_port(p)) continue;
-        kprintd("usb: High-Speed device connected to port %d\n", p);
-        if (usb_init_mass_storage(p) != 0) {
-            usb_ready = 0;
-            ehci_disable_port(p);
-            continue;
+        int enabled = 0;
+        for (int attempt = 0; attempt < 2 && !hc_dead; attempt++) {
+            if (!ehci_reset_port(p)) break;
+            enabled = 1;
+            /* в корневом порту EHCI работает только High-Speed: флешка, хаб
+             * (в т.ч. RMH чипсетов Intel) или что-то ещё */
+            usb_dev_t* d = usb_alloc_dev(0, (uint8_t)p, USB_SPEED_HIGH);
+            if (!d) break;
+            if (usb_enumerate(d) == 0) {
+                if (usb_attach(d, accept)) return 1;
+                break;
+            }
+            kprintd("usb: port %d: high-speed device does not answer\n", p);
         }
-
-        blockdev_t d;
-        memset(&d, 0, sizeof(d));
-        strncpy(d.name, "usb0", BLK_NAME_LEN - 1);
-        strncpy(d.model, usb_model, sizeof(d.model) - 1);
-        d.sector_size = 512;
-        d.total_sectors = usb_total_sectors;
-        d.flags = BLK_FLAG_REMOVABLE;
-        d.read = usb_blk_read;
-        d.write = usb_blk_write;
-
-        if (accept && !accept(&d)) {
-            kprintd("usb: port %d: %s is not the boot disk, skipped\n", p, usb_model);
-            usb_ready = 0;
-            ehci_disable_port(p);
-            continue;
-        }
-
-        blockdev_register(&d);
-        kprinti("usb: mounted %s (%s), %d MB\n", d.name, d.model, d.total_sectors / 2048);
-        return 1;
+        if (enabled) ehci_disable_port(p);
     }
 
     ehci_release_controller();
