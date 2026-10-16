@@ -1,1 +1,5 @@
-PHOTON OS SOURCE CODE - NOT FOR PUBLIC RELEASE
+# PhotonOS
+
+> IHMISEN 1: nu terveh jopta
+
+MINä: midäääääääääh
