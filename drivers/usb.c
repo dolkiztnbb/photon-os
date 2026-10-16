@@ -15,8 +15,12 @@
  *   - Full/Low-Speed устройства прямо в корневом порту отдаются companion-
  *     контроллеру UHCI/OHCI, как это делает BIOS; Low-Speed устройства за
  *     хабами (клавиатуры, мыши) драйвер не трогает вовсе;
- *   - если на контроллере не нашлось нужной флешки, он сбрасывается и
- *     возвращается BIOS (чтобы не ломать BIOS-эмуляцию USB-клавиатуры).
+ *   - если на контроллере не нашлось нужной флешки, он останавливается, а
+ *     его порты отдаются companion-контроллерам, если они есть (как при
+ *     BIOS). Обратно BIOS контроллер НЕ возвращается — так же, как в Linux и Windows: после
+ *     сброса BIOS его обычно заново не опрашивает (USB-клавиатуре это всё
+ *     равно не помогает), а SMM-обработчик BIOS на таком редком пути может
+ *     повесить машину;
  *
  * Чего (пока) нет: xHCI (USB 3.x). На платах, где порты обслуживает только
  * xHCI (Intel 100-й серии и новее, AMD Ryzen, Intel 7-9 серий в режиме xHCI),
@@ -47,6 +51,7 @@ extern void vmm_identity_map_page(uint32_t* pd, uintptr_t phys_addr, uint32_t fl
 #define USB_REQ_SET_ADDRESS     0x05
 #define USB_REQ_GET_DESCRIPTOR  0x06
 #define USB_REQ_SET_CONFIG      0x09
+#define USB_REQ_CLEAR_TT_BUFFER 0x08   /* класс hub (USB 2.0, 11.24.2.3) */
 #define USB_REQ_BOT_RESET       0xFF   /* Bulk-Only Mass Storage Reset (class) */
 
 #define USB_DESC_DEVICE         0x01
@@ -268,9 +273,6 @@ typedef struct {
     volatile uint8_t* op;
     uint32_t n_ports;
     uint32_t n_cc;               /* число companion-контроллеров (UHCI/OHCI) */
-    uint32_t legsup;             /* смещение USBLEGSUP в PCI config, 0 = нет */
-    uint32_t saved_legctlsts;    /* USBLEGCTLSTS до захвата — вернём BIOS при отказе */
-    int      bios_owned;         /* BIOS владел контроллером до нас */
 } ehci_ctrl_t;
 
 static ehci_ctrl_t hc;
@@ -281,6 +283,7 @@ static int hc_dead = 0;          /* контроллер не отвечает �
  * этого хаба — ему нужно знать адрес хаба и номер порта (EHCI 4.12). */
 typedef struct usb_dev {
     struct usb_dev* parent;      /* хаб, в который включено устройство; 0 — корневой порт */
+    struct usb_dev* tt;          /* Full/Low-Speed за High-Speed хабом: этот хаб (его TT) */
     uint8_t  port;               /* номер порта: корневого (с 0) или хаба (с 1) */
     uint8_t  depth;              /* сколько хабов между контроллером и устройством */
     uint8_t  speed;              /* USB_SPEED_* */
@@ -292,6 +295,7 @@ typedef struct usb_dev {
 
 static usb_dev_t usb_devs[USB_MAX_DEVICES];
 static int       usb_ndevs = 0;
+static int       usb_identified = 0;    /* опознанных устройств на контроллере (для сообщений) */
 static uint8_t   next_dev_addr = 1;
 
 /* дескрипторы последнего опрошенного устройства */
@@ -436,6 +440,8 @@ static void qh_setup(ehci_qh_t* qh, const usb_dev_t* d, uint8_t ep, uint16_t mps
     qh->alt_next_qtd = LINK_TERMINATE;
 }
 
+static void usb_clear_tt_buffer(usb_dev_t* d, uint8_t ep, int bulk, int is_in);
+
 /* -------------------------------------------------------------------------- */
 /* Control Transfer (Endpoint 0)                                              */
 /* -------------------------------------------------------------------------- */
@@ -491,12 +497,30 @@ static int usb_control_xfer(usb_dev_t* d, uint8_t req_type, uint8_t req, uint16_
         if (is_in && data) memcpy(data, dma_buffer, got);
         if (actual) *actual = (uint16_t)got;
     }
+    if (res == XFER_TIMEOUT || res == XFER_ERROR)
+        usb_clear_tt_buffer(d, 0, 0, is_in);
     return res;
 }
 
 static int usb_control_msg(usb_dev_t* d, uint8_t req_type, uint8_t req, uint16_t val,
                            uint16_t idx, uint16_t len, void* data) {
     return usb_control_xfer(d, req_type, req, val, idx, len, data, 0);
+}
+
+/* Оборванная по таймауту или сбойная split-транзакция может оставить буфер
+ * transaction translator'а в хабе занятым (USB 2.0, 11.17.5), и тогда все
+ * следующие Full/Low-Speed передачи через этот TT будут стоять. Как и Linux,
+ * после таких ошибок (но не после STALL) посылаем хабу Clear_TT_Buffer. */
+static void usb_clear_tt_buffer(usb_dev_t* d, uint8_t ep, int bulk, int is_in) {
+    if (!d || !d->tt || d->speed == USB_SPEED_HIGH || hc_dead) return;
+    uint16_t info = (uint16_t)((ep & 0x0F) | ((d->addr & 0x7F) << 4) | ((bulk ? 2 : 0) << 11));
+    /* хабы у нас всегда в режиме одного TT (alt setting 0), поэтому wIndex = 1 */
+    if (bulk) {
+        usb_control_msg(d->tt, RT_PORT_OUT, USB_REQ_CLEAR_TT_BUFFER, info | (is_in ? 0x8000 : 0), 1, 0, 0);
+    } else {                                     /* control: оба направления */
+        usb_control_msg(d->tt, RT_PORT_OUT, USB_REQ_CLEAR_TT_BUFFER, info | 0x8000, 1, 0, 0);
+        usb_control_msg(d->tt, RT_PORT_OUT, USB_REQ_CLEAR_TT_BUFFER, info, 1, 0, 0);
+    }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -521,6 +545,8 @@ static int usb_bulk_transfer(int is_in, void* data, uint32_t len, uint32_t* actu
     if (res == XFER_OK && is_in && data && done) {
         memcpy(data, dma_buffer, done);
     }
+    if (res == XFER_TIMEOUT || res == XFER_ERROR)
+        usb_clear_tt_buffer(msc_dev, is_in ? ep_in : ep_out, 1, is_in);
     return res;
 }
 
@@ -592,10 +618,15 @@ static int usb_bot_scsi(const void* cmd, uint8_t cmd_len, void* data, uint32_t d
     return csw.status;                      /* 0 или 1 */
 }
 
-static void usb_request_sense(void) {
+/* REQUEST SENSE: сбрасывает sense-данные (иначе следующая команда тоже упадёт).
+ * Возвращает (sense key << 8) | ASC или -1. */
+#define SENSE_NO_MEDIUM         0x23A  /* NOT READY / MEDIUM NOT PRESENT */
+static int usb_request_sense(void) {
     uint8_t cmd[6] = { SCSI_REQUEST_SENSE, 0, 0, 0, 18, 0 };
     uint8_t sense[18];
-    usb_bot_scsi(cmd, 6, sense, 18, 1);
+    memset(sense, 0, sizeof(sense));
+    if (usb_bot_scsi(cmd, 6, sense, 18, 1) != 0) return -1;
+    return ((sense[2] & 0x0F) << 8) | sense[12];
 }
 
 /* READ(10)/WRITE(10) на count секторов с одним повтором. 0 — успех. */
@@ -717,9 +748,11 @@ static usb_dev_t* usb_alloc_dev(usb_dev_t* parent, uint8_t port, uint8_t speed) 
     d->depth = parent ? parent->depth + 1 : 0;
     if (speed != USB_SPEED_HIGH && parent) {
         if (parent->speed == USB_SPEED_HIGH) {   /* TT — в этом High-Speed хабе */
+            d->tt = parent;
             d->tt_hub = parent->addr;
             d->tt_port = port;
         } else {                                 /* Full-Speed хаб сам за TT */
+            d->tt = parent->tt;
             d->tt_hub = parent->tt_hub;
             d->tt_port = parent->tt_port;
         }
@@ -799,13 +832,27 @@ static int usb_msc_probe(usb_dev_t* d, uint8_t config, uint8_t iface,
     bulk_qh_init(&qh_pool[QH_BULK_IN],  ep_in,  ep_in_mps);
 
     /* Ждём готовности носителя (после включения флешка отвечает
-     * «UNIT ATTENTION», пока у неё не спросят sense-данные). */
+     * «UNIT ATTENTION», пока у неё не спросят sense-данные). Пустой
+     * картридер (их много в ноутбуках) и не отвечающее устройство бросаем
+     * сразу, а не через 20 попыток. */
     uint8_t tur[6] = { SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0 };
-    int ready = 0;
+    int ready = 0, no_medium = 0, dead = 0;
     for (int i = 0; i < 20 && !hc_dead; i++) {
         int r = usb_bot_scsi(tur, 6, 0, 0, 0);
         if (r == 0) { ready = 1; break; }
-        if (r == 1) usb_request_sense();
+        if (r == 1) {
+            if (usb_request_sense() == SENSE_NO_MEDIUM) {
+                if (++no_medium >= 3) {
+                    kprintd("usb: port %s: no medium (empty card reader?), skipped\n", usb_path(d));
+                    return 0;
+                }
+            } else {
+                no_medium = 0;
+            }
+        } else if (++dead >= 3) {
+            kprintw("usb: port %s: mass storage does not respond, skipped\n", usb_path(d));
+            return 0;
+        }
         mdelay(100);
     }
     if (hc_dead) return 0;
@@ -939,14 +986,16 @@ static int hub_port_probe(usb_dev_t* hub, uint8_t port, int (*accept)(blockdev_t
         usb_dev_t* d = usb_alloc_dev(hub, port, speed);
         if (!d) break;
         if (usb_enumerate(d) == 0) {
-            if (usb_attach(d, accept)) return 1;
-            break;
+            /* Опознанное, но не наше устройство (сканер отпечатков, камера,
+             * Bluetooth, чужая флешка...) просто остаётся на своём адресе,
+             * как в Linux: порт не трогаем. */
+            return usb_attach(d, accept);
         }
         /* бывает, что устройство не отвечает с первого раза — ещё один сброс */
         kprintd("usb: port %s: %s-speed device does not answer\n", usb_path(d), speed_name(speed));
     }
-    /* не наше устройство — выключаем порт, чтобы оно не мешало (в т.ч. если
-     * так и осталось на адресе 0) */
+    /* Устройство так и не ответило и может остаться на адресе 0 — выключаем
+     * порт, чтобы оно не отзывалось вместо следующих устройств. */
     hub_port_feature(hub, port, 0, HUB_FEAT_PORT_ENABLE);
     return 0;
 }
@@ -1038,6 +1087,7 @@ static int usb_attach(usb_dev_t* d, int (*accept)(blockdev_t*)) {
     uint16_t vid = dev_desc[8] | (dev_desc[9] << 8);
     uint16_t pid = dev_desc[10] | (dev_desc[11] << 8);
     uint8_t  config = cfg_desc[5];
+    usb_identified++;
 
     /* Интерфейс хаба или Mass Storage / Bulk-Only (alt setting 0) с парой
      * bulk-endpoint'ов. cfg_desc нужно разобрать сейчас: его перезапишут
@@ -1131,19 +1181,14 @@ static int ehci_reset_port(uint32_t p) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Захват и возврат контроллера                                               */
+/* Захват и остановка контроллера                                             */
 /* -------------------------------------------------------------------------- */
 static void ehci_bios_handoff(uint32_t hccparams) {
-    hc.legsup = 0;
-    hc.bios_owned = 0;
     uint32_t eecp = HCC_EECP(hccparams);
     for (int guard = 0; eecp >= 0x40 && guard < 16; guard++) {
         uint32_t cap = pci_read_config_32(hc.bus, hc.dev, hc.fn, eecp);
         if ((cap & 0xFF) == LEGSUP_CAP_ID) {
-            hc.legsup = eecp;
-            hc.saved_legctlsts = pci_read_config_32(hc.bus, hc.dev, hc.fn, eecp + 4);
             if (cap & LEGSUP_BIOS_OWNED) {
-                hc.bios_owned = 1;
                 pci_write_config_8(hc.bus, hc.dev, hc.fn, eecp + 3, 1);    /* HC OS Owned */
                 for (int ms = 0; ms < 1000 && (cap & LEGSUP_BIOS_OWNED); ms += 10) {
                     mdelay(10);
@@ -1165,20 +1210,22 @@ static void ehci_bios_handoff(uint32_t hccparams) {
     }
 }
 
-/* Флешка на этом контроллере не нашлась: останавливаем его, отдаём все порты
- * companion-контроллерам и возвращаем контроллер BIOS, чтобы по возможности
- * не ломать BIOS-эмуляцию USB-клавиатуры (драйвера HID у ядра нет). */
-static void ehci_release_controller(void) {
+/* Флешка на этом контроллере не нашлась: останавливаем его (больше никакого
+ * DMA) и отдаём все порты companion-контроллерам UHCI/OHCI, если они есть,
+ * как было при BIOS, — Low/Full-Speed клавиатуры там снова подхватит BIOS.
+ * Так же Linux выключает EHCI (ehci_silence_controller).
+ *
+ * BIOS контроллер обратно НЕ получает: ни Linux, ни Windows этого не делают.
+ * После нашего сброса BIOS обычно заново устройства не опрашивает (то есть
+ * USB-клавиатуре это не помогает), а его SMM-обработчик на таком редко
+ * используемом пути может повесить машину, причём без единого сообщения на
+ * экране. SMI контроллера остаются выключенными. */
+static void ehci_stop_controller(void) {
     op_write(EHCI_USBCMD, op_read(EHCI_USBCMD) & ~(CMD_RS | CMD_ASE | CMD_PSE));
     op_wait(EHCI_USBSTS, STS_HALTED, STS_HALTED, 20000);
-    op_write(EHCI_CONFIGFLAG, 0);
-    op_write(EHCI_USBCMD, CMD_HCRESET);
-    op_wait(EHCI_USBCMD, CMD_HCRESET, 0, 250000);
-
-    if (hc.legsup) {
-        pci_write_config_32(hc.bus, hc.dev, hc.fn, hc.legsup + 4, hc.saved_legctlsts);
-        if (hc.bios_owned) pci_write_config_8(hc.bus, hc.dev, hc.fn, hc.legsup + 3, 0);
-    }
+    /* Без companion'ов (Intel 5-й серии и новее, порты за RMH) отдавать порты
+     * некому, а запись CONFIGFLAG у Intel может вызвать SMI — не трогаем. */
+    if (hc.n_cc) op_write(EHCI_CONFIGFLAG, 0);
 }
 
 /* Захват, сброс и запуск контроллера. 0 — контроллер работает. */
@@ -1266,31 +1313,35 @@ static int ehci_probe_controller(uint8_t bus, uint8_t dev, uint8_t fn, int (*acc
     }
 
     if (ehci_start_controller(bar0) != 0) {
-        if (hc.op) ehci_release_controller();
+        if (hc.op) ehci_stop_controller();
         return 0;
     }
 
     usb_ndevs = 0;
+    usb_identified = 0;
     next_dev_addr = 1;
     for (uint32_t p = 0; p < hc.n_ports && !hc_dead; p++) {
-        int enabled = 0;
+        int silent = 0;      /* устройство не ответило и может остаться на адресе 0 */
         for (int attempt = 0; attempt < 2 && !hc_dead; attempt++) {
             if (!ehci_reset_port(p)) break;
-            enabled = 1;
             /* в корневом порту EHCI работает только High-Speed: флешка, хаб
              * (в т.ч. RMH чипсетов Intel) или что-то ещё */
             usb_dev_t* d = usb_alloc_dev(0, (uint8_t)p, USB_SPEED_HIGH);
-            if (!d) break;
+            if (!d) { silent = 1; break; }
             if (usb_enumerate(d) == 0) {
+                silent = 0;
                 if (usb_attach(d, accept)) return 1;
                 break;
             }
+            silent = 1;
             kprintd("usb: port %d: high-speed device does not answer\n", p);
         }
-        if (enabled) ehci_disable_port(p);
+        if (silent) ehci_disable_port(p);
     }
 
-    ehci_release_controller();
+    ehci_stop_controller();
+    kprintd("usb: EHCI %x:%x.%x: no boot disk (devices: %d), controller stopped\n",
+            hc.bus, hc.dev, hc.fn, usb_identified);
     return 0;
 }
 
