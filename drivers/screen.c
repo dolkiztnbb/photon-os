@@ -82,7 +82,10 @@ void setcursorpos(const int x, const int y) {
     if (y != -1) offsety = y;
     if (x != -1) offsetx = x;
 
-    if (offsetx >= 80) offsetx = 79;
+    if (offsetx >= 80) {
+        offsetx = 0;
+        offsety++;
+    }
     if (offsety > 24) offsety = 24;
     if (offsetx < 0) offsetx = 0;
     if (offsety < 0) offsety = 0;
@@ -107,20 +110,24 @@ static void scroll_screen(void) {
 // ==============================================================
 
 void kputc_attr(char ch, const char attr) {
+
     if (attr & 0x08) return;
 
+
     if (ansi_state == STATE_ESC) {
-        if (ch == '[') { 
-            ansi_state = STATE_BRACKET; 
-            ansi_param = 0; 
-        } else { 
-            ansi_state = STATE_NORMAL; 
+        if (ch == '[') {
+            ansi_state = STATE_BRACKET;
+            ansi_param = 0;
+        } else {
+            ansi_state = STATE_NORMAL;
         }
         return;
     }
 
+
     if (ansi_state == STATE_BRACKET) {
         if (ch >= '0' && ch <= '9') {
+
 
             ansi_param = ansi_param * 10 + (ch - '0');
         } else if (ch == ';') {
@@ -137,7 +144,7 @@ void kputc_attr(char ch, const char attr) {
                 const unsigned char ansi_to_vga[] = {0, 4, 2, 6, 1, 5, 3, 7};
                 current_color = (current_color & 0x0F) | (ansi_to_vga[ansi_param - 40] << 4);
             }
-            ansi_param = 0; 
+            ansi_param = 0;
         } else if (ch == 'm') {
             if (ansi_param == 0) {
                 // Сброс ANSI (\033[0m) теперь возвращает цвет STDOUT
@@ -153,6 +160,7 @@ void kputc_attr(char ch, const char attr) {
                 current_color = (current_color & 0x0F) | (ansi_to_vga[ansi_param - 40] << 4);
             }
 
+
             ansi_state = STATE_NORMAL;
         } else {
             ansi_state = STATE_NORMAL;
@@ -160,10 +168,12 @@ void kputc_attr(char ch, const char attr) {
         return;
     }
 
+
     if (ch == '\x1b') {
         ansi_state = STATE_ESC;
         return;
     }
+
 
     if (ch == '\n' || ch == '\r') {
         if (ch == '\n') {
@@ -174,13 +184,14 @@ void kputc_attr(char ch, const char attr) {
                 offsety = 24;
             }
         } else {
-            offsetx = 0; 
+            offsetx = 0;
         }
-        
+       
         // if (!(attr & 0x04)) write_char(ch);
-        setcursorpos(offsetx, offsety); 
+        setcursorpos(offsetx, offsety);
         return;
     }
+
 
     if (ch == '\b') {
         if (offsetx > 0) {
@@ -190,40 +201,34 @@ void kputc_attr(char ch, const char attr) {
             offsety--;
         }
         // if (!(attr & 0x04)) write_char('\b');
-        setcursorpos(offsetx, offsety); 
+        setcursorpos(offsetx, offsety);
         return;
     }
 
-    if (offsetx >= 80) { 
-        offsetx = 0; 
-        offsety++; 
+
+    if (offsetx >= 80) {
+        offsetx = 0;
+        offsety++;
         if (offsety > 24) {
             scroll_screen();
             offsety = 24;
         }
     }
+
 
     int vga_idx = offsetx * 2 + offsety * 160;
     VGA[vga_idx] = ch;
     VGA[vga_idx + 1] = current_color;
 
+
     if (current_color != last_com_color) {
         if (!(attr & 0x04)) update_com_color(current_color);
         last_com_color = current_color;
     }
+    // if (!(attr & 0x04)) write_char(ch);
+
 
     offsetx++;
-
-    // Проверка переноса и прокрутки сразу после инкремента
-    if (offsetx >= 80) { 
-        offsetx = 0; 
-        offsety++; 
-        if (offsety > 24) {
-            scroll_screen();
-            offsety = 24;
-        }
-    }
-
     setcursorpos(offsetx, offsety);
 }
 
