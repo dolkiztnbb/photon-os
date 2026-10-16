@@ -10,9 +10,9 @@ void kprintd(const char *format, ...) {
     va_list args;
     va_start(args, format);
     setcursorpos(0,-1);
-    kprintf(0, 0xf, 2, "%f", get_ticks()/((float)(tps)));
+    kprintf(0, 0x3, 2, "%f", get_ticks()/((float)(tps)));
     setcursorpos(11,-1);
-    vkprintf(0, 0x7, 2, format, args);
+    vkprintf(0, 0x3, 2, format, args);
     va_end(args);
 #endif
 }
@@ -21,13 +21,9 @@ void kprinte(const char *format, ...) {
 #ifdef __PHT_DEBUG__
     va_list args;
     va_start(args, format);
-    setcursorpos(0,-1);
-    // kprintf(0, 0x40e, 2, "ERROR    ");
-    for(int i=0;i<80;i++)kprintf(0, 0x40f, 2, " ");
-    setcursorpos(0,-1);
-    kprintf(0, 0x40f, 2, "%f", get_ticks()/((float)(tps)));
+    kprintf(0, 0x4, 2, "%f", get_ticks()/((float)(tps)));
     setcursorpos(11,-1);
-    vkprintf(0, 0x40f, 2, format, args);
+    vkprintf(0, 0x4, 2, format, args);
     va_end(args);
 #endif
 }
@@ -36,12 +32,9 @@ void kprintw(const char *format, ...) {
     va_list args;
     va_start(args, format);
     setcursorpos(0,-1);
-    // kprintf(0, 0x600, 2, "WARNING  ");
-    for(int i=0;i<80;i++)kprintf(0, 0x60e, 2, " ");
-    setcursorpos(0,-1);
-    kprintf(0, 0x60e, 2, "%f", get_ticks()/((float)(tps)));
+    kprintf(0, 0x806+0x8, 2, "%f", get_ticks()/((float)(tps)));
     setcursorpos(11,-1);
-    vkprintf(0, 0x60e, 2, format, args);
+    vkprintf(0, 0x6+0x8, 2, format, args);
     va_end(args);
 #endif
 }
@@ -51,12 +44,9 @@ void kprinti(const char *format, ...) {
     va_list args;
     va_start(args, format);
     setcursorpos(0,-1);
-    // kprintf(0, 0x10f, 2, "INFO     ");
-    for(int i=0;i<80;i++)kprintf(0, 0x10f, 2, " ");
-    setcursorpos(0,-1);
-    kprintf(0, 0x10f, 2, "%f", get_ticks()/((float)(tps)));
+    kprintf(0, 0x3+0x8, 2, "%f", get_ticks()/((float)(tps)));
     setcursorpos(11,-1);
-    vkprintf(0, 0x10f, 2, format, args);
+    vkprintf(0, 0x3+0x8, 2, format, args);
     va_end(args);
 #endif
 }

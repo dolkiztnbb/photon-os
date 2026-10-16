@@ -82,10 +82,7 @@ void setcursorpos(const int x, const int y) {
     if (y != -1) offsety = y;
     if (x != -1) offsetx = x;
 
-    if (offsetx >= 80) {
-        offsetx = 0;
-        offsety++;
-    }
+    if (offsetx >= 80) offsetx = 79;
     if (offsety > 24) offsety = 24;
     if (offsetx < 0) offsetx = 0;
     if (offsety < 0) offsety = 0;
@@ -214,10 +211,20 @@ void kputc_attr(char ch, const char attr) {
         if (!(attr & 0x04)) update_com_color(current_color);
         last_com_color = current_color;
     }
-    // if (!(attr & 0x04)) write_char(ch);
 
     offsetx++;
-    setcursorpos(offsetx, offsety); 
+
+    // Проверка переноса и прокрутки сразу после инкремента
+    if (offsetx >= 80) { 
+        offsetx = 0; 
+        offsety++; 
+        if (offsety > 24) {
+            scroll_screen();
+            offsety = 24;
+        }
+    }
+
+    setcursorpos(offsetx, offsety);
 }
 
 void kputc(char ch) {

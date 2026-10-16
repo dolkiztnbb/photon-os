@@ -1242,13 +1242,13 @@ vga_disable_blink:
 ; =============================================================================
 ;  Данные / сообщения
 ; =============================================================================
-msg_banner:     db 13, 10, "PhotonOS loader (stage2) v2 - FS kernel support", 13, 10, 0
-msg_drive:      db "boot drive: 0x", 0
-msg_hdd:        db " [HDD/USB, LBA]", 0
-msg_floppy:     db " [floppy, CHS]", 0
-msg_cdrom:      db " [CD-ROM, El Torito]", 0
-msg_iso:        db " [ISO]", 0
-msg_image_lba:  db ", image LBA 0x", 0
+msg_banner:     db 13, 10, "PhLo", 13, 10, 0
+msg_drive:      db "boot drive=0x", 0
+msg_hdd:        db " HDD/USB", 0
+msg_floppy:     db " floppy, CHS", 0
+msg_cdrom:      db " CD-ROM, El Torito", 0
+msg_iso:        db " ISO", 0
+msg_image_lba:  db ", image LBA=0x", 0
 msg_kernel_lba: db "loading kernel (LBA) ", 0
 msg_ramdisk:    db "copying image to RAM ", 0
 msg_ok:         db " OK", 13, 10, 0
@@ -1265,10 +1265,10 @@ msg_fs_kernel_fail:         db "FS kernel not found, fallback to LBA", 13, 10, 0
 msg_fs_kernel_ok:           db "FS kernel loaded OK", 13, 10, 0
 msg_loading_fs_kernel:      db "loading FS kernel: ", 0
 msg_newline:                db 13, 10, 0
-msg_kernel_list_header:     db 13, 10, "Available kernels in /sys/kernel:", 13, 10, 0
+msg_kernel_list_header:     db 13, 10, "available kernels in /sys/kernel:", 13, 10, 0
 msg_kernel_list_item:       db "  ", 0
 msg_default_tag:            db " [default]", 0
-msg_kernel_select_prompt:   db 13, 10, "Select kernel [0-9] or Enter for default (", 0
+msg_kernel_select_prompt:   db 13, 10, "select kernel [0-9] or enter for default (", 0
 msg_prompt_end:             db "): ", 0
 
 name_sys:           db "sys",0
