@@ -783,7 +783,7 @@ load_image_region:
     call copy_to_high
     add [.dest], eax
 
-    mov eax, [.chunk]`
+    mov eax, [.chunk]
     add [.cur_lba], eax
     sub [.remaining], eax
     mov cl, [.subshift]
